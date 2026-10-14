@@ -14,13 +14,26 @@ import {
 import type { RefinerPreflight } from './preflight.js';
 import type { PreparedRun } from './run-directory.js';
 
-interface WorkingImage {
+export interface WorkingImage {
   readonly imageId: number;
   readonly cameraId: number;
   readonly name: string;
   readonly qvec: readonly number[];
   readonly tvec: readonly number[];
-  readonly linkedObservations: number;
+  readonly observations: readonly {
+    readonly x: number;
+    readonly y: number;
+    readonly point3DId: number | null;
+  }[];
+}
+
+export interface WorkingPoint {
+  readonly point3DId: number;
+  readonly xyz: readonly [number, number, number];
+  readonly track: readonly {
+    readonly imageId: number;
+    readonly point2DIndex: number;
+  }[];
 }
 
 export async function runFixedPoseTriangulation(
@@ -60,8 +73,8 @@ export async function runFixedPoseTriangulation(
   const imagesBytes = await readFile(join(exportDirectory, 'images.txt'));
   const pointsBytes = await readFile(join(exportDirectory, 'points3D.txt'));
   const camera = readCamera(camerasBytes.toString());
-  const images = readImages(imagesBytes.toString());
-  const pointCount = readPointCount(pointsBytes.toString());
+  const images = readWorkingImages(imagesBytes.toString());
+  const points = readWorkingPoints(pointsBytes.toString());
 
   const knownCamera = known.cameras[0]!;
   if (
@@ -105,10 +118,11 @@ export async function runFixedPoseTriangulation(
   }
 
   const observationCount = images.reduce(
-    (sum, image) => sum + image.linkedObservations,
+    (sum, image) =>
+      sum + image.observations.filter((entry) => entry.point3DId !== null).length,
     0
   );
-  if (pointCount === 0 || observationCount === 0) {
+  if (points.length === 0 || observationCount === 0) {
     throw new Error('triangulation produced no usable tracks.');
   }
 
@@ -119,7 +133,7 @@ export async function runFixedPoseTriangulation(
         schemaVersion: 1,
         imageCount: images.length,
         observationCount,
-        pointCount,
+        pointCount: points.length,
         export: {
           path: 'exports/triangulated',
           files: {
@@ -162,7 +176,7 @@ function readCamera(source: string): {
   };
 }
 
-function readImages(source: string): readonly WorkingImage[] {
+export function readWorkingImages(source: string): readonly WorkingImage[] {
   const lines = source.split(/\r?\n/);
   const images: WorkingImage[] = [];
   for (let index = 0; index < lines.length; index++) {
@@ -186,13 +200,17 @@ function readImages(source: string): readonly WorkingImage[] {
     if (observations.length % 3 !== 0) {
       throw new Error('triangulation observation row is malformed.');
     }
-    let linkedObservations = 0;
+    const decoded = [];
     for (let offset = 2; offset < observations.length; offset += 3) {
       const pointId = observations[offset]!;
       if (!Number.isSafeInteger(pointId) || pointId < -1) {
         throw new Error('triangulation observation has an invalid point ID.');
       }
-      if (pointId !== -1) linkedObservations++;
+      decoded.push({
+        x: observations[offset - 2]!,
+        y: observations[offset - 1]!,
+        point3DId: pointId === -1 ? null : pointId,
+      });
     }
     images.push({
       imageId: positiveInteger(numeric[0], 'triangulation image ID'),
@@ -200,24 +218,40 @@ function readImages(source: string): readonly WorkingImage[] {
       tvec: numeric.slice(5, 8),
       cameraId: positiveInteger(numeric[8], 'triangulation camera ID'),
       name: tokens[9]!,
-      linkedObservations,
+      observations: decoded,
     });
   }
   return images;
 }
 
-function readPointCount(source: string): number {
+export function readWorkingPoints(source: string): readonly WorkingPoint[] {
   const rows = dataLines(source);
-  for (const row of rows) {
+  return rows.map((row) => {
     const tokens = row.split(/\s+/);
     const values = tokens.map(Number);
     requireFinite(values, 'triangulation point');
     if (tokens.length < 12 || (tokens.length - 8) % 2 !== 0) {
       throw new Error('triangulation point track is malformed.');
     }
-    positiveInteger(values[0], 'triangulation point ID');
-  }
-  return rows.length;
+    const track = [];
+    for (let offset = 8; offset < values.length; offset += 2) {
+      track.push({
+        imageId: positiveInteger(
+          values[offset],
+          'triangulation track image ID'
+        ),
+        point2DIndex: nonNegativeInteger(
+          values[offset + 1],
+          'triangulation point2D index'
+        ),
+      });
+    }
+    return {
+      point3DId: positiveInteger(values[0], 'triangulation point ID'),
+      xyz: [values[1]!, values[2]!, values[3]!] as const,
+      track,
+    };
+  });
 }
 
 function dataLines(source: string): readonly string[] {
@@ -256,6 +290,16 @@ function sameNumbers(left: readonly number[], right: readonly number[]) {
 function positiveInteger(value: number | undefined, field: string): number {
   if (value === undefined || !Number.isSafeInteger(value) || value <= 0) {
     throw new Error(`${field} must be a positive safe integer.`);
+  }
+  return value;
+}
+
+function nonNegativeInteger(
+  value: number | undefined,
+  field: string
+): number {
+  if (value === undefined || !Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`${field} must be a non-negative safe integer.`);
   }
   return value;
 }

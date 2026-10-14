@@ -230,12 +230,29 @@ describe('runRefinerCli', () => {
     const exitCode = await runRefinerCli(
       ['refine', '--config', configPath],
       (message) => messages.push(message),
-      successfulColmapExecutor([], { returnedTranslationX: 1 })
+      successfulColmapExecutor([], { returnedTranslationX: 2 })
     );
 
     expect(exitCode).toBe(1);
     expect(messages.at(-1)).toBe(
       'Execution error: triangulation changed pose for frame-000001.jpg.'
+    );
+  });
+
+  it('stops before BA when a required loop pair lacks verified support', async () => {
+    const directory = await preparedDirectory();
+    const configPath = await writeConfig(directory, validSelection);
+    const messages: string[] = [];
+
+    const exitCode = await runRefinerCli(
+      ['refine', '--config', configPath],
+      (message) => messages.push(message),
+      successfulColmapExecutor([], { omitLoopMatches: true })
+    );
+
+    expect(exitCode).toBe(1);
+    expect(messages.at(-1)).toBe(
+      'Execution error: pre-BA support is insufficient for frame-000001.jpg / frame-000003.jpg.'
     );
   });
 
@@ -341,7 +358,7 @@ describe('runRefinerCli', () => {
           imageName: 'frame-000001.jpg',
           cameraId: 1,
           qvec: [1, 0, 0, 0],
-          tvec: [0, 0, 0],
+          tvec: [1, 0, 0],
         },
         {
           originalImageId: 2,
@@ -355,7 +372,7 @@ describe('runRefinerCli', () => {
           imageName: 'frame-000003.jpg',
           cameraId: 1,
           qvec: [1, 0, 0, 0],
-          tvec: [0, 0, 0],
+          tvec: [-1, 0, 0],
         },
       ],
     });
@@ -407,6 +424,53 @@ describe('runRefinerCli', () => {
     expect(
       JSON.parse(
         await readFile(
+          join(runsDirectory, firstRun!, 'metrics', 'pre-ba-support.json'),
+          'utf8'
+        )
+      )
+    ).toEqual(
+      expect.objectContaining({
+        schemaVersion: 1,
+        status: 'pass',
+        policy: {
+          minVerifiedMatches: 15,
+          minUsableTracks: 10,
+          minUsableObservations: 20,
+          minParallaxDegrees: 1.5,
+          depthEpsilon: 0.000001,
+          coverageGridRows: 10,
+          coverageGridColumns: 10,
+          minCoverageEachImage: 0.05,
+        },
+        connectedComponents: [
+          [
+            'frame-000001.jpg',
+            'frame-000002.jpg',
+            'frame-000003.jpg',
+          ],
+        ],
+        pairs: expect.arrayContaining([
+          expect.objectContaining({
+            images: ['frame-000001.jpg', 'frame-000003.jpg'],
+            roles: ['loop'],
+            rawMatches: 20,
+            verifiedMatches: 15,
+            usableTrackCount: 15,
+            usableObservationCount: 30,
+            status: 'pass',
+          }),
+        ]),
+      })
+    );
+    expect(
+      await readFile(
+        join(runsDirectory, firstRun!, 'metrics', 'loop-support.md'),
+        'utf8'
+      )
+    ).toContain('| frame-000001.jpg / frame-000003.jpg | loop | 20 | 15 | 15 |');
+    expect(
+      JSON.parse(
+        await readFile(
           join(runsDirectory, firstRun!, 'evidence', 'database-handoff.json'),
           'utf8'
         )
@@ -451,11 +515,11 @@ describe('runRefinerCli', () => {
         schemaVersion: 1,
         rawMatches: {
           before: { pairs: 0, correspondences: 0 },
-          after: { pairs: 1, correspondences: 12 },
+          after: { pairs: 3, correspondences: 60 },
         },
         verifiedMatches: {
           before: { pairs: 0, correspondences: 0 },
-          after: { pairs: 1, correspondences: 8 },
+          after: { pairs: 3, correspondences: 45 },
         },
       })
     );
@@ -470,8 +534,8 @@ describe('runRefinerCli', () => {
       expect.objectContaining({
         schemaVersion: 1,
         imageCount: 3,
-        observationCount: 6,
-        pointCount: 2,
+        observationCount: 45,
+        pointCount: 15,
       })
     );
     expect(
@@ -493,19 +557,21 @@ describe('runRefinerCli', () => {
     ).toBe(1);
     expect(await readdir(runsDirectory)).toHaveLength(2);
     expect(await readFile(firstRecordPath)).toEqual(firstRecordBytes);
-    expect(messages).toHaveLength(12);
+    expect(messages).toHaveLength(14);
     expect(messages[0]).toMatch(/^Prepared run: /);
     expect(messages[1]).toBe('Feature extraction: complete');
     expect(messages[2]).toBe('Feature database identity: verified');
     expect(messages[3]).toBe('Exhaustive matching: complete');
     expect(messages[4]).toBe('Fixed-pose triangulation: complete');
-    expect(messages[5]).toBe('Pipeline execution is not implemented yet.');
-    expect(messages[6]).toMatch(/^Prepared run: /);
-    expect(messages[7]).toBe('Feature extraction: complete');
-    expect(messages[8]).toBe('Feature database identity: verified');
-    expect(messages[9]).toBe('Exhaustive matching: complete');
-    expect(messages[10]).toBe('Fixed-pose triangulation: complete');
-    expect(messages[11]).toBe('Pipeline execution is not implemented yet.');
+    expect(messages[5]).toBe('Pre-BA support: verified');
+    expect(messages[6]).toBe('Pipeline execution is not implemented yet.');
+    expect(messages[7]).toMatch(/^Prepared run: /);
+    expect(messages[8]).toBe('Feature extraction: complete');
+    expect(messages[9]).toBe('Feature database identity: verified');
+    expect(messages[10]).toBe('Exhaustive matching: complete');
+    expect(messages[11]).toBe('Fixed-pose triangulation: complete');
+    expect(messages[12]).toBe('Pre-BA support: verified');
+    expect(messages[13]).toBe('Pipeline execution is not implemented yet.');
   });
 });
 
@@ -569,6 +635,7 @@ function successfulColmapExecutor(
     readonly cameraParams?: readonly [number, number, number, number];
     readonly addMatches?: boolean;
     readonly returnedTranslationX?: number;
+    readonly omitLoopMatches?: boolean;
   } = {}
 ): NativeCommandExecutor {
   const imageNames = options.imageNames ?? [
@@ -583,12 +650,12 @@ function successfulColmapExecutor(
       writeFeaturesDatabase(command.cwd, imageNames, cameraParams);
     }
     if (command.stage === 'exhaustive-matcher' && options.addMatches !== false) {
-      writeMatchRows(command.cwd);
+      writeMatchRows(command.cwd, options.omitLoopMatches === true);
     }
     if (command.stage === 'model-converter') {
       await writeTriangulatedText(
         command.cwd,
-        options.returnedTranslationX ?? 0
+        options.returnedTranslationX ?? 1
       );
     }
     return successfulResult('COLMAP 4.2.0 be5e291 (CUDA)');
@@ -608,22 +675,32 @@ async function writeTriangulatedText(
     join(directory, 'images.txt'),
     [
       `20 1 0 0 0 ${returnedTranslationX} 0 0 41 frame-000001.jpg`,
-      '10 10 1 20 20 2',
+      observationsFor(20),
       '5 1 0 0 0 0 0 0 41 frame-000002.jpg',
-      '11 10 1 21 20 2',
-      '80 1 0 0 0 0 0 0 41 frame-000003.jpg',
-      '12 10 1 22 20 2',
+      observationsFor(5),
+      '80 1 0 0 0 -1 0 0 41 frame-000003.jpg',
+      observationsFor(80),
       '',
     ].join('\n')
   );
   await writeFile(
     join(directory, 'points3D.txt'),
-    [
-      '1 0 0 1 255 0 0 0.1 20 0 5 0 80 0',
-      '2 1 0 1 0 255 0 0.2 20 1 5 1 80 1',
-      '',
-    ].join('\n')
+    `${Array.from({ length: 15 }, (_, index) =>
+      `${index + 1} ${pointFor(index).join(' ')} 255 0 0 0.1 20 ${index} 5 ${index} 80 ${index}`
+    ).join('\n')}\n`
   );
+}
+
+function observationsFor(imageId: 20 | 5 | 80): string {
+  const translation = imageId === 20 ? 1 : imageId === 80 ? -1 : 0;
+  return Array.from({ length: 15 }, (_, index) => {
+    const [x, y, z] = pointFor(index);
+    return `${500 * ((x + translation) / z) + 320} ${500 * (y / z) + 240} ${index + 1}`;
+  }).join(' ');
+}
+
+function pointFor(index: number): readonly [number, number, number] {
+  return [((index % 5) - 2) * 1.5, (Math.floor(index / 5) - 1) * 1.5, 10];
 }
 
 function writeFeaturesDatabase(
@@ -636,7 +713,7 @@ function writeFeaturesDatabase(
   );
   try {
     database.exec(
-      'CREATE TABLE cameras (camera_id INTEGER, model INTEGER, width INTEGER, height INTEGER, params BLOB, prior_focal_length INTEGER); CREATE TABLE images (image_id INTEGER, name TEXT, camera_id INTEGER); CREATE TABLE matches (pair_id INTEGER, rows INTEGER, cols INTEGER, data BLOB); CREATE TABLE two_view_geometries (pair_id INTEGER, rows INTEGER, cols INTEGER, data BLOB)'
+      'CREATE TABLE cameras (camera_id INTEGER, model INTEGER, width INTEGER, height INTEGER, params BLOB, prior_focal_length INTEGER); CREATE TABLE images (image_id INTEGER, name TEXT, camera_id INTEGER); CREATE TABLE keypoints (image_id INTEGER, rows INTEGER, cols INTEGER, data BLOB); CREATE TABLE matches (pair_id INTEGER, rows INTEGER, cols INTEGER, data BLOB); CREATE TABLE two_view_geometries (pair_id INTEGER, rows INTEGER, cols INTEGER, data BLOB)'
     );
     const params = Buffer.alloc(32);
     cameraParams.forEach((value, index) =>
@@ -651,25 +728,58 @@ function writeFeaturesDatabase(
         .prepare('INSERT INTO images VALUES (?, ?, 41)')
         .run(ids[index]!, name)
     );
+    ids.forEach((imageId) => {
+      const keypoints = Buffer.alloc(15 * 2 * 4);
+      for (let index = 0; index < 15; index++) {
+        const [x, y, z] = pointFor(index);
+        const translation = imageId === 20 ? 1 : imageId === 80 ? -1 : 0;
+        keypoints.writeFloatLE(
+          500 * ((x + translation) / z) + 320,
+          index * 8
+        );
+        keypoints.writeFloatLE(500 * (y / z) + 240, index * 8 + 4);
+      }
+      database
+        .prepare('INSERT INTO keypoints VALUES (?, 15, 2, ?)')
+        .run(imageId, keypoints);
+    });
   } finally {
     database.close();
   }
 }
 
-function writeMatchRows(runDirectory: string): void {
+function writeMatchRows(runDirectory: string, omitLoopMatches: boolean): void {
   const database = new DatabaseSync(
     join(runDirectory, 'database', 'exhaustive.db')
   );
   try {
-    database
-      .prepare('INSERT INTO matches VALUES (1, 12, 2, ?)')
-      .run(Buffer.alloc(12 * 2 * 4));
-    database
-      .prepare('INSERT INTO two_view_geometries VALUES (1, 8, 2, ?)')
-      .run(Buffer.alloc(8 * 2 * 4));
+    for (const [first, second] of [
+      [5, 20],
+      [5, 80],
+      ...(omitLoopMatches ? [] : [[20, 80]]),
+    ]) {
+      const pairId = BigInt(first!) * 2_147_483_647n + BigInt(second!);
+      const raw = matchBlob(20);
+      const verified = matchBlob(15);
+      database
+        .prepare('INSERT INTO matches VALUES (?, 20, 2, ?)')
+        .run(pairId, raw);
+      database
+        .prepare('INSERT INTO two_view_geometries VALUES (?, 15, 2, ?)')
+        .run(pairId, verified);
+    }
   } finally {
     database.close();
   }
+}
+
+function matchBlob(rows: number): Buffer {
+  const bytes = Buffer.alloc(rows * 2 * 4);
+  for (let index = 0; index < rows; index++) {
+    bytes.writeUInt32LE(index % 15, index * 8);
+    bytes.writeUInt32LE(index % 15, index * 8 + 4);
+  }
+  return bytes;
 }
 
 function successfulResult(stdout: string) {
@@ -690,11 +800,11 @@ async function recorderZip(): Promise<Uint8Array> {
     'sparse/0/images.txt',
     encoder.encode(
       [
-        '1 1 0 0 0 0 0 0 1 frame-000001.jpg',
+        '1 1 0 0 0 1 0 0 1 frame-000001.jpg',
         '',
         '2 1 0 0 0 0 0 0 1 frame-000002.jpg',
         '',
-        '3 1 0 0 0 0 0 0 1 frame-000003.jpg',
+        '3 1 0 0 0 -1 0 0 1 frame-000003.jpg',
         '',
       ].join('\n')
     )

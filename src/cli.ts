@@ -9,6 +9,7 @@ import { runFeatureExtraction } from './refiner/feature-extraction.js';
 import { verifyAndFreezeFeatureDatabase } from './refiner/database-handoff.js';
 import { runExhaustiveMatching } from './refiner/exhaustive-matching.js';
 import { runFixedPoseTriangulation } from './refiner/triangulation.js';
+import { verifyPreBaSupport } from './refiner/pre-ba-support.js';
 
 type WriteMessage = (message: string) => void;
 
@@ -59,6 +60,8 @@ export async function runRefinerCli(
     writeMessage('Exhaustive matching: complete');
     await runFixedPoseTriangulation(preflight, run, executor);
     writeMessage('Fixed-pose triangulation: complete');
+    await verifyPreBaSupport(preflight, run);
+    writeMessage('Pre-BA support: verified');
     writeMessage('Pipeline execution is not implemented yet.');
     return 1;
   } catch (error) {
