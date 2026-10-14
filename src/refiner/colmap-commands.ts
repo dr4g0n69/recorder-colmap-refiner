@@ -1,6 +1,18 @@
 import type { PinholeCamera } from '../colmap/index.js';
 import type { NativeCommand } from './native-command.js';
 
+export function colmapIdentityCommand(
+  executable: string,
+  runDirectory: string
+): NativeCommand {
+  return {
+    stage: 'colmap-identity',
+    executable,
+    args: ['-h'],
+    cwd: runDirectory,
+  };
+}
+
 export function featureExtractionCommand(
   executable: string,
   runDirectory: string,

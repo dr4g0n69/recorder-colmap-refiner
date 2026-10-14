@@ -7,8 +7,16 @@ import { readRecorderZip, type RecorderDataset } from '../colmap/index.js';
 export interface RefinerRunConfig {
   readonly inputZip: string;
   readonly outputDirectory: string;
+  readonly colmap: ColmapIdentity;
   readonly anchors: readonly [string, string, string];
   readonly loopPairs: readonly (readonly [string, string])[];
+}
+
+export interface ColmapIdentity {
+  readonly executable: string;
+  readonly version: string;
+  readonly build: string;
+  readonly sha256: string;
 }
 
 export interface RefinerPreflight {
@@ -30,12 +38,14 @@ export async function preflightRunConfig(
   const anchors = parseAnchors(raw.anchors);
   const loopPairs = parseLoopPairs(raw.loopPairs);
   const configDirectory = dirname(resolve(configPath));
+  const colmap = await parseColmapIdentity(raw.colmap, configDirectory);
   const config: RefinerRunConfig = {
     inputZip: resolve(configDirectory, requiredPath(raw.inputZip, 'inputZip')),
     outputDirectory: resolve(
       configDirectory,
       requiredPath(raw.outputDirectory, 'outputDirectory')
     ),
+    colmap,
     anchors,
     loopPairs,
   };
@@ -61,6 +71,34 @@ export async function preflightRunConfig(
       dataset.model.images.map((image) => image.name)
     ),
   };
+}
+
+async function parseColmapIdentity(
+  value: unknown,
+  configDirectory: string
+): Promise<ColmapIdentity> {
+  if (!isRecord(value)) {
+    throw new Error('colmap must define an executable identity.');
+  }
+  const executable = resolve(
+    configDirectory,
+    requiredString(value.executable, 'colmap.executable')
+  );
+  const version = requiredString(value.version, 'colmap.version');
+  const build = requiredString(value.build, 'colmap.build');
+  const sha256 = requiredString(value.sha256, 'colmap.sha256').toLowerCase();
+  if (!/^[a-f0-9]{64}$/.test(sha256)) {
+    throw new Error('colmap.sha256 must be a 64-character hexadecimal hash.');
+  }
+  const actualHash = createHash('sha256')
+    .update(await readFile(executable))
+    .digest('hex');
+  if (actualHash !== sha256) {
+    throw new Error(
+      'COLMAP executable SHA-256 does not match the configured identity.'
+    );
+  }
+  return { executable, version, build, sha256 };
 }
 
 function adjacentImagePairs(
@@ -97,8 +135,16 @@ function parseLoopPairs(
 }
 
 function requiredPath(value: unknown, field: string): string {
+  return requiredString(value, field, 'path');
+}
+
+function requiredString(
+  value: unknown,
+  field: string,
+  description = 'value'
+): string {
   if (!isNonEmptyString(value)) {
-    throw new Error(`${field} must be a non-empty path.`);
+    throw new Error(`${field} must be a non-empty ${description}.`);
   }
   return value;
 }

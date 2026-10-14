@@ -37,74 +37,89 @@ export async function executeNativeCommands(
   commands: readonly NativeCommand[],
   executor: NativeCommandExecutor,
   logsDirectory: string
-): Promise<void> {
+): Promise<readonly NativeCommandResult[]> {
   await mkdir(logsDirectory, { recursive: true });
+  const results: NativeCommandResult[] = [];
 
   for (const [index, command] of commands.entries()) {
-    validateStage(command.stage);
-    const prefix = `${String(index + 1).padStart(2, '0')}-${command.stage}`;
+    results.push(
+      await executeNativeCommand(command, executor, logsDirectory, index)
+    );
+  }
+  return results;
+}
+
+export async function executeNativeCommand(
+  command: NativeCommand,
+  executor: NativeCommandExecutor,
+  logsDirectory: string,
+  index: number
+): Promise<NativeCommandResult> {
+  await mkdir(logsDirectory, { recursive: true });
+  validateStage(command.stage);
+  const prefix = `${String(index + 1).padStart(2, '0')}-${command.stage}`;
+  await writeJson(
+    join(logsDirectory, `${prefix}-command.json`),
+    { schemaVersion: 1, ...command },
+    'wx'
+  );
+
+  const startedAt = new Date();
+  let result: NativeCommandResult;
+  try {
+    result = await executor(command);
+  } catch (error) {
+    const finishedAt = new Date();
     await writeJson(
-      join(logsDirectory, `${prefix}-command.json`),
-      { schemaVersion: 1, ...command },
+      join(logsDirectory, `${prefix}-result.json`),
+      {
+        schemaVersion: 1,
+        startedAt: startedAt.toISOString(),
+        finishedAt: finishedAt.toISOString(),
+        elapsedMs: finishedAt.getTime() - startedAt.getTime(),
+        exitCode: null,
+        signal: null,
+        error: error instanceof Error ? error.message : String(error),
+      },
       'wx'
     );
-
-    const startedAt = new Date();
-    let result: NativeCommandResult;
-    try {
-      result = await executor(command);
-    } catch (error) {
-      const finishedAt = new Date();
-      await writeJson(
-        join(logsDirectory, `${prefix}-result.json`),
-        {
-          schemaVersion: 1,
-          startedAt: startedAt.toISOString(),
-          finishedAt: finishedAt.toISOString(),
-          elapsedMs: finishedAt.getTime() - startedAt.getTime(),
-          exitCode: null,
-          signal: null,
-          error: error instanceof Error ? error.message : String(error),
-        },
-        'wx'
-      );
-      throw new NativeCommandError(
-        command.stage,
-        null,
-        `${command.stage} could not be started.`
-      );
-    }
-
-    const finishedAt = new Date();
-    await Promise.all([
-      writeFile(join(logsDirectory, `${prefix}-stdout.log`), result.stdout, {
-        flag: 'wx',
-      }),
-      writeFile(join(logsDirectory, `${prefix}-stderr.log`), result.stderr, {
-        flag: 'wx',
-      }),
-      writeJson(
-        join(logsDirectory, `${prefix}-result.json`),
-        {
-          schemaVersion: 1,
-          startedAt: startedAt.toISOString(),
-          finishedAt: finishedAt.toISOString(),
-          elapsedMs: finishedAt.getTime() - startedAt.getTime(),
-          exitCode: result.exitCode,
-          signal: result.signal,
-        },
-        'wx'
-      ),
-    ]);
-
-    if (result.exitCode !== 0) {
-      throw new NativeCommandError(
-        command.stage,
-        result.exitCode,
-        `${command.stage} failed with exit code ${String(result.exitCode)}.`
-      );
-    }
+    throw new NativeCommandError(
+      command.stage,
+      null,
+      `${command.stage} could not be started.`
+    );
   }
+
+  const finishedAt = new Date();
+  await Promise.all([
+    writeFile(join(logsDirectory, `${prefix}-stdout.log`), result.stdout, {
+      flag: 'wx',
+    }),
+    writeFile(join(logsDirectory, `${prefix}-stderr.log`), result.stderr, {
+      flag: 'wx',
+    }),
+    writeJson(
+      join(logsDirectory, `${prefix}-result.json`),
+      {
+        schemaVersion: 1,
+        startedAt: startedAt.toISOString(),
+        finishedAt: finishedAt.toISOString(),
+        elapsedMs: finishedAt.getTime() - startedAt.getTime(),
+        exitCode: result.exitCode,
+        signal: result.signal,
+      },
+      'wx'
+    ),
+  ]);
+
+  if (result.exitCode !== 0) {
+    throw new NativeCommandError(
+      command.stage,
+      result.exitCode,
+      `${command.stage} failed with exit code ${String(result.exitCode)}.`
+    );
+  }
+  return result;
 }
 
 export const spawnNativeCommand: NativeCommandExecutor = (command) =>

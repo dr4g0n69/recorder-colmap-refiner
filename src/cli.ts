@@ -1,12 +1,18 @@
 import { preflightRunConfig } from './refiner/preflight.js';
 import { createPreparedRun } from './refiner/run-directory.js';
 import { materializeRunWorkspace } from './refiner/workspace.js';
+import {
+  spawnNativeCommand,
+  type NativeCommandExecutor,
+} from './refiner/native-command.js';
+import { runFeatureExtraction } from './refiner/feature-extraction.js';
 
 type WriteMessage = (message: string) => void;
 
 export async function runRefinerCli(
   args: readonly string[],
-  writeMessage: WriteMessage
+  writeMessage: WriteMessage,
+  executor: NativeCommandExecutor = spawnNativeCommand
 ): Promise<number> {
   const [command, flag, configPath, ...extra] = args;
   if (
@@ -29,15 +35,26 @@ export async function runRefinerCli(
     return 1;
   }
 
+  let run;
   try {
-    const run = await createPreparedRun(preflight);
+    run = await createPreparedRun(preflight);
     await materializeRunWorkspace(preflight, run);
     writeMessage(`Prepared run: ${run.runDirectory}`);
+  } catch (error) {
+    writeMessage(
+      `Preparation error: ${error instanceof Error ? error.message : String(error)}`
+    );
+    return 1;
+  }
+
+  try {
+    await runFeatureExtraction(preflight, run, executor);
+    writeMessage('Feature extraction: complete');
     writeMessage('Pipeline execution is not implemented yet.');
     return 1;
   } catch (error) {
     writeMessage(
-      `Preparation error: ${error instanceof Error ? error.message : String(error)}`
+      `Execution error: ${error instanceof Error ? error.message : String(error)}`
     );
     return 1;
   }

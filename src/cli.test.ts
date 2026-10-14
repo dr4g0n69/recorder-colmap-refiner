@@ -15,6 +15,10 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import { runRefinerCli } from './cli.js';
 import { parseRecorderColmapText } from './colmap/text-codec.js';
+import type {
+  NativeCommand,
+  NativeCommandExecutor,
+} from './refiner/native-command.js';
 
 const temporaryDirectories: string[] = [];
 
@@ -101,22 +105,69 @@ describe('runRefinerCli', () => {
     await expect(readFile(join(directory, 'runs'))).rejects.toThrow();
   });
 
-  it('creates independent immutable records for repeated valid preflights', async () => {
+  it('rejects an unexpected COLMAP executable before creating a run', async () => {
     const directory = await preparedDirectory();
-    const selection = {
-      anchors: [
-        'frame-000001.jpg',
-        'frame-000002.jpg',
-        'frame-000003.jpg',
-      ],
-      loopPairs: [['frame-000001.jpg', 'frame-000003.jpg']] as const,
-    } as const;
-    const configPath = await writeConfig(directory, selection);
+    const configPath = await writeConfig(
+      directory,
+      validSelection,
+      '0'.repeat(64)
+    );
+    const calls: NativeCommand[] = [];
     const messages: string[] = [];
 
+    const exitCode = await runRefinerCli(
+      ['refine', '--config', configPath],
+      (message) => messages.push(message),
+      async (command) => {
+        calls.push(command);
+        return successfulResult('');
+      }
+    );
+
+    expect(exitCode).toBe(1);
+    expect(calls).toEqual([]);
+    expect(messages).toEqual([
+      'Configuration error: COLMAP executable SHA-256 does not match the configured identity.',
+    ]);
+    await expect(readFile(join(directory, 'runs'))).rejects.toThrow();
+  });
+
+  it('stops before feature extraction when COLMAP help lacks the expected build', async () => {
+    const directory = await preparedDirectory();
+    const configPath = await writeConfig(directory, validSelection);
+    const calls: NativeCommand[] = [];
+    const messages: string[] = [];
+
+    const exitCode = await runRefinerCli(
+      ['refine', '--config', configPath],
+      (message) => messages.push(message),
+      async (command) => {
+        calls.push(command);
+        return successfulResult('COLMAP 4.2.0 unknown build');
+      }
+    );
+
+    expect(exitCode).toBe(1);
+    expect(calls.map((command) => command.stage)).toEqual(['colmap-identity']);
+    expect(messages[0]).toMatch(/^Prepared run: /);
+    expect(messages[1]).toBe(
+      'Execution error: COLMAP help does not match configured version/build identity.'
+    );
+  });
+
+  it('creates independent immutable records for repeated valid preflights', async () => {
+    const directory = await preparedDirectory();
+    const selection = validSelection;
+    const configPath = await writeConfig(directory, selection);
+    const messages: string[] = [];
+    const calls: NativeCommand[] = [];
+    const executor = successfulColmapExecutor(calls);
+
     expect(
-      await runRefinerCli(['refine', '--config', configPath], (message) =>
-        messages.push(message)
+      await runRefinerCli(
+        ['refine', '--config', configPath],
+        (message) => messages.push(message),
+        executor
       )
     ).toBe(1);
 
@@ -139,6 +190,14 @@ describe('runRefinerCli', () => {
         sha256: createHash('sha256').update(inputBytes).digest('hex'),
       },
       outputDirectory: runsDirectory,
+      colmap: {
+        executable: join(directory, 'colmap.exe'),
+        version: '4.2.0',
+        build: 'be5e291 (CUDA)',
+        sha256: createHash('sha256')
+          .update(await readFile(join(directory, 'colmap.exe')))
+          .digest('hex'),
+      },
       anchors: selection.anchors,
       loopPairs: selection.loopPairs,
       sequentialPairs: [
@@ -224,21 +283,68 @@ describe('runRefinerCli', () => {
         (await stat(join(runsDirectory, firstRun!, relativePath))).isDirectory()
       ).toBe(true);
     }
+    const firstDatabaseDirectory = join(
+      runsDirectory,
+      firstRun!,
+      'database'
+    );
+    await expect(
+      readFile(join(firstDatabaseDirectory, 'exhaustive.db'))
+    ).rejects.toThrow();
+    expect(
+      JSON.parse(
+        await readFile(
+          join(
+            runsDirectory,
+            firstRun!,
+            'evidence',
+            'feature-extraction.json'
+          ),
+          'utf8'
+        )
+      )
+    ).toEqual(
+      expect.objectContaining({
+        schemaVersion: 1,
+        featuresDatabase: expect.objectContaining({
+          path: 'database/features.db',
+        }),
+      })
+    );
+    expect(
+      calls.map((command) => [command.stage, command.args[0]])
+    ).toEqual([
+      ['colmap-identity', '-h'],
+      ['feature-extractor', 'feature_extractor'],
+    ]);
 
     expect(
-      await runRefinerCli(['refine', '--config', configPath], (message) =>
-        messages.push(message)
+      await runRefinerCli(
+        ['refine', '--config', configPath],
+        (message) => messages.push(message),
+        executor
       )
     ).toBe(1);
     expect(await readdir(runsDirectory)).toHaveLength(2);
     expect(await readFile(firstRecordPath)).toEqual(firstRecordBytes);
-    expect(messages).toHaveLength(4);
+    expect(messages).toHaveLength(6);
     expect(messages[0]).toMatch(/^Prepared run: /);
-    expect(messages[1]).toBe('Pipeline execution is not implemented yet.');
-    expect(messages[2]).toMatch(/^Prepared run: /);
-    expect(messages[3]).toBe('Pipeline execution is not implemented yet.');
+    expect(messages[1]).toBe('Feature extraction: complete');
+    expect(messages[2]).toBe('Pipeline execution is not implemented yet.');
+    expect(messages[3]).toMatch(/^Prepared run: /);
+    expect(messages[4]).toBe('Feature extraction: complete');
+    expect(messages[5]).toBe('Pipeline execution is not implemented yet.');
   });
 });
+
+const validSelection = {
+  anchors: [
+    'frame-000001.jpg',
+    'frame-000002.jpg',
+    'frame-000003.jpg',
+  ],
+  loopPairs: [['frame-000001.jpg', 'frame-000003.jpg']] as const,
+} as const;
 
 async function temporaryDirectory(): Promise<string> {
   const directory = await mkdtemp(join(tmpdir(), 'recorder-colmap-refiner-'));
@@ -249,6 +355,7 @@ async function temporaryDirectory(): Promise<string> {
 async function preparedDirectory(): Promise<string> {
   const directory = await temporaryDirectory();
   await writeFile(join(directory, 'capture.zip'), await recorderZip());
+  await writeFile(join(directory, 'colmap.exe'), 'fake-colmap');
   return directory;
 }
 
@@ -257,18 +364,46 @@ async function writeConfig(
   selection: {
     anchors: readonly string[];
     loopPairs: readonly (readonly [string, string])[];
-  }
+  },
+  colmapSha256?: string
 ): Promise<string> {
   const path = join(directory, 'run.json');
+  const executable = join(directory, 'colmap.exe');
   await writeFile(
     path,
     JSON.stringify({
       inputZip: './capture.zip',
       outputDirectory: './runs',
+      colmap: {
+        executable: './colmap.exe',
+        version: '4.2.0',
+        build: 'be5e291 (CUDA)',
+        sha256:
+          colmapSha256 ??
+          createHash('sha256')
+            .update(await readFile(executable))
+            .digest('hex'),
+      },
       ...selection,
     })
   );
   return path;
+}
+
+function successfulColmapExecutor(
+  calls: NativeCommand[]
+): NativeCommandExecutor {
+  return async (command) => {
+    calls.push(command);
+    if (command.stage === 'feature-extractor') {
+      await writeFile(join(command.cwd, 'database', 'features.db'), 'features');
+    }
+    return successfulResult('COLMAP 4.2.0 be5e291 (CUDA)');
+  };
+}
+
+function successfulResult(stdout: string) {
+  return { exitCode: 0, signal: null, stdout, stderr: '' } as const;
 }
 
 async function recorderZip(): Promise<Uint8Array> {

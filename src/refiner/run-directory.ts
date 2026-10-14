@@ -23,6 +23,7 @@ export async function createPreparedRun(
       sha256: preflight.inputSha256,
     },
     outputDirectory: preflight.config.outputDirectory,
+    colmap: preflight.config.colmap,
     anchors: preflight.config.anchors,
     loopPairs: preflight.config.loopPairs,
     sequentialPairs: preflight.sequentialPairs,
