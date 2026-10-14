@@ -14,6 +14,7 @@ export interface RefinerRunConfig {
 export interface RefinerPreflight {
   readonly config: RefinerRunConfig;
   readonly dataset: RecorderDataset;
+  readonly inputZipBytes: Uint8Array;
   readonly inputSha256: string;
   readonly sequentialPairs: readonly (readonly [string, string])[];
 }
@@ -38,8 +39,8 @@ export async function preflightRunConfig(
     anchors,
     loopPairs,
   };
-  const inputBytes = await readFile(config.inputZip);
-  const dataset = await readRecorderZip(new Uint8Array(inputBytes));
+  const inputZipBytes = new Uint8Array(await readFile(config.inputZip));
+  const dataset = await readRecorderZip(inputZipBytes);
   const imageNames = new Set(dataset.model.images.map((image) => image.name));
 
   for (const anchor of config.anchors) {
@@ -54,7 +55,8 @@ export async function preflightRunConfig(
   return {
     config,
     dataset,
-    inputSha256: createHash('sha256').update(inputBytes).digest('hex'),
+    inputZipBytes,
+    inputSha256: createHash('sha256').update(inputZipBytes).digest('hex'),
     sequentialPairs: adjacentImagePairs(
       dataset.model.images.map((image) => image.name)
     ),

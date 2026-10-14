@@ -1,5 +1,12 @@
 import { createHash } from 'node:crypto';
-import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import {
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  stat,
+  writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -7,6 +14,7 @@ import { Uint8ArrayReader, Uint8ArrayWriter, ZipWriter } from '@zip.js/zip.js';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { runRefinerCli } from './cli.js';
+import { parseRecorderColmapText } from './colmap/text-codec.js';
 
 const temporaryDirectories: string[] = [];
 
@@ -139,6 +147,83 @@ describe('runRefinerCli', () => {
       ],
       imageCount: 3,
     });
+    expect(
+      await readFile(join(runsDirectory, firstRun!, 'input', 'original.zip'))
+    ).toEqual(inputBytes);
+    expect(await readdir(join(runsDirectory, firstRun!, 'images'))).toEqual([
+      'frame-000001.jpg',
+      'frame-000002.jpg',
+      'frame-000003.jpg',
+    ]);
+    expect(
+      Array.from(
+        await readFile(
+          join(runsDirectory, firstRun!, 'images', 'frame-000001.jpg')
+        )
+      )
+    ).toEqual([255, 216, 1, 255, 217]);
+
+    const knownDirectory = join(runsDirectory, firstRun!, 'models', 'known');
+    const knownModel = parseRecorderColmapText({
+      cameras: await readFile(join(knownDirectory, 'cameras.txt')),
+      images: await readFile(join(knownDirectory, 'images.txt')),
+      points3D: await readFile(join(knownDirectory, 'points3D.txt')),
+    });
+    expect(knownModel.cameras).toHaveLength(1);
+    expect(knownModel.images.map((image) => image.name)).toEqual([
+      'frame-000001.jpg',
+      'frame-000002.jpg',
+      'frame-000003.jpg',
+    ]);
+    expect(
+      knownModel.images.every((image) => image.observations.length === 0)
+    ).toBe(true);
+    expect(knownModel.points3D).toEqual([]);
+    expect(
+      JSON.parse(
+        await readFile(join(runsDirectory, firstRun!, 'poses.json'), 'utf8')
+      )
+    ).toEqual({
+      schemaVersion: 1,
+      images: [
+        {
+          originalImageId: 1,
+          imageName: 'frame-000001.jpg',
+          cameraId: 1,
+          qvec: [1, 0, 0, 0],
+          tvec: [0, 0, 0],
+        },
+        {
+          originalImageId: 2,
+          imageName: 'frame-000002.jpg',
+          cameraId: 1,
+          qvec: [1, 0, 0, 0],
+          tvec: [0, 0, 0],
+        },
+        {
+          originalImageId: 3,
+          imageName: 'frame-000003.jpg',
+          cameraId: 1,
+          qvec: [1, 0, 0, 0],
+          tvec: [0, 0, 0],
+        },
+      ],
+    });
+    for (const relativePath of [
+      'database',
+      'models/triangulated',
+      'models/adjusted',
+      'exports/triangulated',
+      'exports/adjusted',
+      'output',
+      'logs',
+      'metrics',
+      'evidence',
+    ]) {
+      expect(
+        (await stat(join(runsDirectory, firstRun!, relativePath))).isDirectory()
+      ).toBe(true);
+    }
 
     expect(
       await runRefinerCli(['refine', '--config', configPath], (message) =>
@@ -209,13 +294,23 @@ async function recorderZip(): Promise<Uint8Array> {
       ].join('\n')
     )
   );
-  await add('sparse/0/points3D.txt', new Uint8Array());
-  for (const name of [
+  await add(
+    'sparse/0/points3D.txt',
+    encoder.encode('7 0 0 1 1 2 3 0.5\n')
+  );
+  for (const [index, name] of [
     'frame-000001.jpg',
     'frame-000002.jpg',
     'frame-000003.jpg',
-  ]) {
-    await add(`images/${name}`, new Uint8Array([255, 216, 255, 217]));
+  ].entries()) {
+    await add(
+      `images/${name}`,
+      new Uint8Array([255, 216, index + 1, 255, 217])
+    );
   }
+  await add(
+    'images/unreferenced.jpg',
+    new Uint8Array([255, 216, 99, 255, 217])
+  );
   return writer.close();
 }

@@ -1,5 +1,6 @@
 import { preflightRunConfig } from './refiner/preflight.js';
 import { createPreparedRun } from './refiner/run-directory.js';
+import { materializeRunWorkspace } from './refiner/workspace.js';
 
 type WriteMessage = (message: string) => void;
 
@@ -30,6 +31,7 @@ export async function runRefinerCli(
 
   try {
     const run = await createPreparedRun(preflight);
+    await materializeRunWorkspace(preflight, run);
     writeMessage(`Prepared run: ${run.runDirectory}`);
     writeMessage('Pipeline execution is not implemented yet.');
     return 1;
