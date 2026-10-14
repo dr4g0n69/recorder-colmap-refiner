@@ -12,6 +12,7 @@ import { runFixedPoseTriangulation } from './refiner/triangulation.js';
 import { verifyPreBaSupport } from './refiner/pre-ba-support.js';
 import { inspectBundleAdjustment } from './refiner/ba-inspection.js';
 import { runBundleAdjustment } from './refiner/ba-solve.js';
+import { evaluatePostBaSafety } from './refiner/post-ba-safety.js';
 
 type WriteMessage = (message: string) => void;
 
@@ -68,6 +69,8 @@ export async function runRefinerCli(
     writeMessage('BA configuration: inspected without solving');
     await runBundleAdjustment(preflight, run, executor);
     writeMessage('Three-anchor bundle adjustment: complete');
+    const verdict = await evaluatePostBaSafety(preflight, run);
+    writeMessage(`Post-BA geometry: ${verdict}`);
     writeMessage('Pipeline execution is not implemented yet.');
     return 1;
   } catch (error) {

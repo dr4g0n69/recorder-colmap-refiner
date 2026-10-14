@@ -564,6 +564,24 @@ describe('runRefinerCli', () => {
       })
     );
     expect(
+      JSON.parse(
+        await readFile(
+          join(runsDirectory, firstRun!, 'metrics', 'post-ba-safety.json'),
+          'utf8'
+        )
+      )
+    ).toEqual(
+      expect.objectContaining({
+        schemaVersion: 1,
+        verdict: 'Rejected',
+        finalAcceptance: false,
+        nextRequiredGate: null,
+        rejections: expect.arrayContaining([
+          'Aggregate epipolar error did not improve.',
+        ]),
+      })
+    );
+    expect(
       await readFile(
         join(runsDirectory, firstRun!, 'metrics', 'loop-support.md'),
         'utf8'
@@ -694,17 +712,19 @@ describe('runRefinerCli', () => {
     expect(messages[5]).toBe('Pre-BA support: verified');
     expect(messages[6]).toBe('BA configuration: inspected without solving');
     expect(messages[7]).toBe('Three-anchor bundle adjustment: complete');
-    expect(messages[8]).toBe('Pipeline execution is not implemented yet.');
-    expect(messages[9]).toMatch(/^Prepared run: /);
-    expect(messages[10]).toBe('Feature extraction: complete');
-    expect(messages[11]).toBe('Feature database identity: verified');
-    expect(messages[12]).toBe('Exhaustive matching: complete');
-    expect(messages[13]).toBe('Fixed-pose triangulation: complete');
-    expect(messages[14]).toBe('Pre-BA support: verified');
-    expect(messages[15]).toBe('BA configuration: inspected without solving');
-    expect(messages[16]).toBe('Three-anchor bundle adjustment: complete');
-    expect(messages[17]).toBe('Pipeline execution is not implemented yet.');
-    expect(messages).toHaveLength(18);
+    expect(messages[8]).toBe('Post-BA geometry: Rejected');
+    expect(messages[9]).toBe('Pipeline execution is not implemented yet.');
+    expect(messages[10]).toMatch(/^Prepared run: /);
+    expect(messages[11]).toBe('Feature extraction: complete');
+    expect(messages[12]).toBe('Feature database identity: verified');
+    expect(messages[13]).toBe('Exhaustive matching: complete');
+    expect(messages[14]).toBe('Fixed-pose triangulation: complete');
+    expect(messages[15]).toBe('Pre-BA support: verified');
+    expect(messages[16]).toBe('BA configuration: inspected without solving');
+    expect(messages[17]).toBe('Three-anchor bundle adjustment: complete');
+    expect(messages[18]).toBe('Post-BA geometry: Rejected');
+    expect(messages[19]).toBe('Pipeline execution is not implemented yet.');
+    expect(messages).toHaveLength(20);
   });
 });
 
