@@ -1,10 +1,6 @@
-import { readFile } from 'node:fs/promises';
+import { preflightRunConfig } from './refiner/preflight.js';
 
 type WriteMessage = (message: string) => void;
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
 
 export async function runRefinerCli(
   args: readonly string[],
@@ -22,21 +18,7 @@ export async function runRefinerCli(
   }
 
   try {
-    const config: unknown = JSON.parse(await readFile(configPath, 'utf8'));
-    if (
-      !isRecord(config) ||
-      !Array.isArray(config.anchors) ||
-      config.anchors.length !== 3 ||
-      !config.anchors.every(
-        (anchor) => typeof anchor === 'string' && anchor.length > 0
-      )
-    ) {
-      writeMessage(
-        'Configuration error: anchors must contain exactly three image names.'
-      );
-      return 1;
-    }
-
+    await preflightRunConfig(configPath);
     writeMessage('Pipeline execution is not implemented yet.');
     return 1;
   } catch (error) {
