@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 
@@ -13,6 +14,8 @@ export interface RefinerRunConfig {
 export interface RefinerPreflight {
   readonly config: RefinerRunConfig;
   readonly dataset: RecorderDataset;
+  readonly inputSha256: string;
+  readonly sequentialPairs: readonly (readonly [string, string])[];
 }
 
 export async function preflightRunConfig(
@@ -35,9 +38,8 @@ export async function preflightRunConfig(
     anchors,
     loopPairs,
   };
-  const dataset = await readRecorderZip(
-    new Uint8Array(await readFile(config.inputZip))
-  );
+  const inputBytes = await readFile(config.inputZip);
+  const dataset = await readRecorderZip(new Uint8Array(inputBytes));
   const imageNames = new Set(dataset.model.images.map((image) => image.name));
 
   for (const anchor of config.anchors) {
@@ -49,14 +51,27 @@ export async function preflightRunConfig(
     }
   }
 
-  return { config, dataset };
+  return {
+    config,
+    dataset,
+    inputSha256: createHash('sha256').update(inputBytes).digest('hex'),
+    sequentialPairs: adjacentImagePairs(
+      dataset.model.images.map((image) => image.name)
+    ),
+  };
+}
+
+function adjacentImagePairs(
+  imageNames: readonly string[]
+): readonly (readonly [string, string])[] {
+  return imageNames.slice(1).map((imageName, index) => [
+    imageNames[index]!,
+    imageName,
+  ]);
 }
 
 function parseAnchors(value: unknown): readonly [string, string, string] {
-  if (
-    !isImageTriple(value) ||
-    new Set(value).size !== 3
-  ) {
+  if (!isImageTriple(value) || new Set(value).size !== 3) {
     throw new Error('anchors must contain exactly three image names.');
   }
   return value;
@@ -70,10 +85,7 @@ function parseLoopPairs(
   }
 
   return value.map((pair, index) => {
-    if (
-      !isImagePair(pair) ||
-      pair[0] === pair[1]
-    ) {
+    if (!isImagePair(pair) || pair[0] === pair[1]) {
       throw new Error(
         `loopPairs[${index}] must contain two distinct image names.`
       );

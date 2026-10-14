@@ -1,4 +1,5 @@
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -90,6 +91,67 @@ describe('runRefinerCli', () => {
       'Configuration error: loop-pair image frame-000099.jpg is absent from the recorder model.',
     ]);
     await expect(readFile(join(directory, 'runs'))).rejects.toThrow();
+  });
+
+  it('creates independent immutable records for repeated valid preflights', async () => {
+    const directory = await preparedDirectory();
+    const selection = {
+      anchors: [
+        'frame-000001.jpg',
+        'frame-000002.jpg',
+        'frame-000003.jpg',
+      ],
+      loopPairs: [['frame-000001.jpg', 'frame-000003.jpg']] as const,
+    } as const;
+    const configPath = await writeConfig(directory, selection);
+    const messages: string[] = [];
+
+    expect(
+      await runRefinerCli(['refine', '--config', configPath], (message) =>
+        messages.push(message)
+      )
+    ).toBe(1);
+
+    const runsDirectory = join(directory, 'runs');
+    const [firstRun] = await readdir(runsDirectory);
+    expect(firstRun).toBeDefined();
+    const firstRecordPath = join(
+      runsDirectory,
+      firstRun!,
+      'resolved-config.json'
+    );
+    const firstRecordBytes = await readFile(firstRecordPath);
+    const firstRecord = JSON.parse(firstRecordBytes.toString()) as unknown;
+    const inputBytes = await readFile(join(directory, 'capture.zip'));
+
+    expect(firstRecord).toEqual({
+      schemaVersion: 1,
+      inputZip: {
+        path: join(directory, 'capture.zip'),
+        sha256: createHash('sha256').update(inputBytes).digest('hex'),
+      },
+      outputDirectory: runsDirectory,
+      anchors: selection.anchors,
+      loopPairs: selection.loopPairs,
+      sequentialPairs: [
+        ['frame-000001.jpg', 'frame-000002.jpg'],
+        ['frame-000002.jpg', 'frame-000003.jpg'],
+      ],
+      imageCount: 3,
+    });
+
+    expect(
+      await runRefinerCli(['refine', '--config', configPath], (message) =>
+        messages.push(message)
+      )
+    ).toBe(1);
+    expect(await readdir(runsDirectory)).toHaveLength(2);
+    expect(await readFile(firstRecordPath)).toEqual(firstRecordBytes);
+    expect(messages).toHaveLength(4);
+    expect(messages[0]).toMatch(/^Prepared run: /);
+    expect(messages[1]).toBe('Pipeline execution is not implemented yet.');
+    expect(messages[2]).toMatch(/^Prepared run: /);
+    expect(messages[3]).toBe('Pipeline execution is not implemented yet.');
   });
 });
 
