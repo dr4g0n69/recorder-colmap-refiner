@@ -75,6 +75,7 @@ describe('COLMAP command builders', () => {
         '0',
       ],
       cwd: runDirectory,
+      timeoutMs: 30 * 60 * 1000,
     });
     expect(
       triangulationCommand(executable, runDirectory, 'database/exhaustive.db')

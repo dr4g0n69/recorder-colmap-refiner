@@ -60,6 +60,7 @@ export function exhaustiveMatchingCommand(
       '0',
     ],
     cwd: runDirectory,
+    timeoutMs: 30 * 60 * 1000,
   };
 }
 

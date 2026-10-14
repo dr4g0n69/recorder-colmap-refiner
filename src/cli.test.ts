@@ -203,6 +203,23 @@ describe('runRefinerCli', () => {
     ).rejects.toThrow();
   });
 
+  it('rejects a successful matcher command that adds no correspondences', async () => {
+    const directory = await preparedDirectory();
+    const configPath = await writeConfig(directory, validSelection);
+    const messages: string[] = [];
+
+    const exitCode = await runRefinerCli(
+      ['refine', '--config', configPath],
+      (message) => messages.push(message),
+      successfulColmapExecutor([], undefined, undefined, false)
+    );
+
+    expect(exitCode).toBe(1);
+    expect(messages.at(-1)).toBe(
+      'Execution error: exhaustive matcher added no verified correspondences.'
+    );
+  });
+
   it('creates independent immutable records for repeated valid preflights', async () => {
     const directory = await preparedDirectory();
     const selection = validSelection;
@@ -336,7 +353,9 @@ describe('runRefinerCli', () => {
       firstRun!,
       'database'
     );
-    expect(await readFile(join(firstDatabaseDirectory, 'exhaustive.db'))).toEqual(
+    expect(
+      await readFile(join(firstDatabaseDirectory, 'exhaustive.db'))
+    ).not.toEqual(
       await readFile(join(firstDatabaseDirectory, 'features.db'))
     );
     expect(
@@ -395,10 +414,31 @@ describe('runRefinerCli', () => {
       })
     );
     expect(
+      JSON.parse(
+        await readFile(
+          join(runsDirectory, firstRun!, 'evidence', 'exhaustive-matching.json'),
+          'utf8'
+        )
+      )
+    ).toEqual(
+      expect.objectContaining({
+        schemaVersion: 1,
+        rawMatches: {
+          before: { pairs: 0, correspondences: 0 },
+          after: { pairs: 1, correspondences: 12 },
+        },
+        verifiedMatches: {
+          before: { pairs: 0, correspondences: 0 },
+          after: { pairs: 1, correspondences: 8 },
+        },
+      })
+    );
+    expect(
       calls.map((command) => [command.stage, command.args[0]])
     ).toEqual([
       ['colmap-identity', '-h'],
       ['feature-extractor', 'feature_extractor'],
+      ['exhaustive-matcher', 'exhaustive_matcher'],
     ]);
 
     expect(
@@ -410,15 +450,17 @@ describe('runRefinerCli', () => {
     ).toBe(1);
     expect(await readdir(runsDirectory)).toHaveLength(2);
     expect(await readFile(firstRecordPath)).toEqual(firstRecordBytes);
-    expect(messages).toHaveLength(8);
+    expect(messages).toHaveLength(10);
     expect(messages[0]).toMatch(/^Prepared run: /);
     expect(messages[1]).toBe('Feature extraction: complete');
     expect(messages[2]).toBe('Feature database identity: verified');
-    expect(messages[3]).toBe('Pipeline execution is not implemented yet.');
-    expect(messages[4]).toMatch(/^Prepared run: /);
-    expect(messages[5]).toBe('Feature extraction: complete');
-    expect(messages[6]).toBe('Feature database identity: verified');
-    expect(messages[7]).toBe('Pipeline execution is not implemented yet.');
+    expect(messages[3]).toBe('Exhaustive matching: complete');
+    expect(messages[4]).toBe('Pipeline execution is not implemented yet.');
+    expect(messages[5]).toMatch(/^Prepared run: /);
+    expect(messages[6]).toBe('Feature extraction: complete');
+    expect(messages[7]).toBe('Feature database identity: verified');
+    expect(messages[8]).toBe('Exhaustive matching: complete');
+    expect(messages[9]).toBe('Pipeline execution is not implemented yet.');
   });
 });
 
@@ -484,12 +526,16 @@ function successfulColmapExecutor(
   ],
   cameraParams: readonly [number, number, number, number] = [
     500, 500, 320, 240,
-  ]
+  ],
+  addMatches = true
 ): NativeCommandExecutor {
   return async (command) => {
     calls.push(command);
     if (command.stage === 'feature-extractor') {
       writeFeaturesDatabase(command.cwd, imageNames, cameraParams);
+    }
+    if (command.stage === 'exhaustive-matcher' && addMatches) {
+      writeMatchRows(command.cwd);
     }
     return successfulResult('COLMAP 4.2.0 be5e291 (CUDA)');
   };
@@ -505,7 +551,7 @@ function writeFeaturesDatabase(
   );
   try {
     database.exec(
-      'CREATE TABLE cameras (camera_id INTEGER, model INTEGER, width INTEGER, height INTEGER, params BLOB, prior_focal_length INTEGER); CREATE TABLE images (image_id INTEGER, name TEXT, camera_id INTEGER)'
+      'CREATE TABLE cameras (camera_id INTEGER, model INTEGER, width INTEGER, height INTEGER, params BLOB, prior_focal_length INTEGER); CREATE TABLE images (image_id INTEGER, name TEXT, camera_id INTEGER); CREATE TABLE matches (pair_id INTEGER, rows INTEGER, cols INTEGER, data BLOB); CREATE TABLE two_view_geometries (pair_id INTEGER, rows INTEGER, cols INTEGER, data BLOB)'
     );
     const params = Buffer.alloc(32);
     cameraParams.forEach((value, index) =>
@@ -520,6 +566,22 @@ function writeFeaturesDatabase(
         .prepare('INSERT INTO images VALUES (?, ?, 41)')
         .run(ids[index]!, name)
     );
+  } finally {
+    database.close();
+  }
+}
+
+function writeMatchRows(runDirectory: string): void {
+  const database = new DatabaseSync(
+    join(runDirectory, 'database', 'exhaustive.db')
+  );
+  try {
+    database
+      .prepare('INSERT INTO matches VALUES (1, 12, 2, ?)')
+      .run(Buffer.alloc(12 * 2 * 4));
+    database
+      .prepare('INSERT INTO two_view_geometries VALUES (1, 8, 2, ?)')
+      .run(Buffer.alloc(8 * 2 * 4));
   } finally {
     database.close();
   }
