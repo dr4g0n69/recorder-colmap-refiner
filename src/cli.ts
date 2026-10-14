@@ -6,6 +6,7 @@ import {
   type NativeCommandExecutor,
 } from './refiner/native-command.js';
 import { runFeatureExtraction } from './refiner/feature-extraction.js';
+import { verifyAndFreezeFeatureDatabase } from './refiner/database-handoff.js';
 
 type WriteMessage = (message: string) => void;
 
@@ -50,6 +51,8 @@ export async function runRefinerCli(
   try {
     await runFeatureExtraction(preflight, run, executor);
     writeMessage('Feature extraction: complete');
+    await verifyAndFreezeFeatureDatabase(preflight, run);
+    writeMessage('Feature database identity: verified');
     writeMessage('Pipeline execution is not implemented yet.');
     return 1;
   } catch (error) {

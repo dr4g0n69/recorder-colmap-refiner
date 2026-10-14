@@ -9,6 +9,7 @@ import {
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 
 import { Uint8ArrayReader, Uint8ArrayWriter, ZipWriter } from '@zip.js/zip.js';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -155,6 +156,53 @@ describe('runRefinerCli', () => {
     );
   });
 
+  it('rejects a case-changed database image before freezing the matching checkpoint', async () => {
+    const directory = await preparedDirectory();
+    const configPath = await writeConfig(directory, validSelection);
+    const messages: string[] = [];
+    const calls: NativeCommand[] = [];
+
+    const exitCode = await runRefinerCli(
+      ['refine', '--config', configPath],
+      (message) => messages.push(message),
+      successfulColmapExecutor(calls, [
+        'Frame-000001.jpg',
+        'frame-000002.jpg',
+        'frame-000003.jpg',
+      ])
+    );
+
+    expect(exitCode).toBe(1);
+    expect(messages.at(-1)).toBe(
+      'Execution error: database filenames must exactly match recorder filenames case-sensitively.'
+    );
+    const [run] = await readdir(join(directory, 'runs'));
+    await expect(
+      readFile(join(directory, 'runs', run!, 'database', 'exhaustive.db'))
+    ).rejects.toThrow();
+  });
+
+  it('rejects changed database calibration before freezing the matching checkpoint', async () => {
+    const directory = await preparedDirectory();
+    const configPath = await writeConfig(directory, validSelection);
+    const messages: string[] = [];
+
+    const exitCode = await runRefinerCli(
+      ['refine', '--config', configPath],
+      (message) => messages.push(message),
+      successfulColmapExecutor([], undefined, [501, 500, 320, 240])
+    );
+
+    expect(exitCode).toBe(1);
+    expect(messages.at(-1)).toBe(
+      'Execution error: database camera must exactly match recorder calibration.'
+    );
+    const [run] = await readdir(join(directory, 'runs'));
+    await expect(
+      readFile(join(directory, 'runs', run!, 'database', 'exhaustive.db'))
+    ).rejects.toThrow();
+  });
+
   it('creates independent immutable records for repeated valid preflights', async () => {
     const directory = await preparedDirectory();
     const selection = validSelection;
@@ -288,9 +336,9 @@ describe('runRefinerCli', () => {
       firstRun!,
       'database'
     );
-    await expect(
-      readFile(join(firstDatabaseDirectory, 'exhaustive.db'))
-    ).rejects.toThrow();
+    expect(await readFile(join(firstDatabaseDirectory, 'exhaustive.db'))).toEqual(
+      await readFile(join(firstDatabaseDirectory, 'features.db'))
+    );
     expect(
       JSON.parse(
         await readFile(
@@ -312,6 +360,41 @@ describe('runRefinerCli', () => {
       })
     );
     expect(
+      JSON.parse(
+        await readFile(
+          join(runsDirectory, firstRun!, 'evidence', 'database-handoff.json'),
+          'utf8'
+        )
+      )
+    ).toEqual(
+      expect.objectContaining({
+        schemaVersion: 1,
+        images: [
+          {
+            originalImageId: 1,
+            imageName: 'frame-000001.jpg',
+            databaseImageId: 20,
+            originalCameraId: 1,
+            databaseCameraId: 41,
+          },
+          {
+            originalImageId: 2,
+            imageName: 'frame-000002.jpg',
+            databaseImageId: 5,
+            originalCameraId: 1,
+            databaseCameraId: 41,
+          },
+          {
+            originalImageId: 3,
+            imageName: 'frame-000003.jpg',
+            databaseImageId: 80,
+            originalCameraId: 1,
+            databaseCameraId: 41,
+          },
+        ],
+      })
+    );
+    expect(
       calls.map((command) => [command.stage, command.args[0]])
     ).toEqual([
       ['colmap-identity', '-h'],
@@ -327,13 +410,15 @@ describe('runRefinerCli', () => {
     ).toBe(1);
     expect(await readdir(runsDirectory)).toHaveLength(2);
     expect(await readFile(firstRecordPath)).toEqual(firstRecordBytes);
-    expect(messages).toHaveLength(6);
+    expect(messages).toHaveLength(8);
     expect(messages[0]).toMatch(/^Prepared run: /);
     expect(messages[1]).toBe('Feature extraction: complete');
-    expect(messages[2]).toBe('Pipeline execution is not implemented yet.');
-    expect(messages[3]).toMatch(/^Prepared run: /);
-    expect(messages[4]).toBe('Feature extraction: complete');
-    expect(messages[5]).toBe('Pipeline execution is not implemented yet.');
+    expect(messages[2]).toBe('Feature database identity: verified');
+    expect(messages[3]).toBe('Pipeline execution is not implemented yet.');
+    expect(messages[4]).toMatch(/^Prepared run: /);
+    expect(messages[5]).toBe('Feature extraction: complete');
+    expect(messages[6]).toBe('Feature database identity: verified');
+    expect(messages[7]).toBe('Pipeline execution is not implemented yet.');
   });
 });
 
@@ -391,15 +476,53 @@ async function writeConfig(
 }
 
 function successfulColmapExecutor(
-  calls: NativeCommand[]
+  calls: NativeCommand[],
+  imageNames: readonly string[] = [
+    'frame-000001.jpg',
+    'frame-000002.jpg',
+    'frame-000003.jpg',
+  ],
+  cameraParams: readonly [number, number, number, number] = [
+    500, 500, 320, 240,
+  ]
 ): NativeCommandExecutor {
   return async (command) => {
     calls.push(command);
     if (command.stage === 'feature-extractor') {
-      await writeFile(join(command.cwd, 'database', 'features.db'), 'features');
+      writeFeaturesDatabase(command.cwd, imageNames, cameraParams);
     }
     return successfulResult('COLMAP 4.2.0 be5e291 (CUDA)');
   };
+}
+
+function writeFeaturesDatabase(
+  runDirectory: string,
+  imageNames: readonly string[],
+  cameraParams: readonly [number, number, number, number]
+): void {
+  const database = new DatabaseSync(
+    join(runDirectory, 'database', 'features.db')
+  );
+  try {
+    database.exec(
+      'CREATE TABLE cameras (camera_id INTEGER, model INTEGER, width INTEGER, height INTEGER, params BLOB, prior_focal_length INTEGER); CREATE TABLE images (image_id INTEGER, name TEXT, camera_id INTEGER)'
+    );
+    const params = Buffer.alloc(32);
+    cameraParams.forEach((value, index) =>
+      params.writeDoubleLE(value, index * 8)
+    );
+    database
+      .prepare('INSERT INTO cameras VALUES (41, 1, 640, 480, ?, 1)')
+      .run(params);
+    const ids = [20, 5, 80];
+    imageNames.forEach((name, index) =>
+      database
+        .prepare('INSERT INTO images VALUES (?, ?, 41)')
+        .run(ids[index]!, name)
+    );
+  } finally {
+    database.close();
+  }
 }
 
 function successfulResult(stdout: string) {
