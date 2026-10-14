@@ -8,6 +8,7 @@ export interface RefinerRunConfig {
   readonly inputZip: string;
   readonly outputDirectory: string;
   readonly colmap: ColmapIdentity;
+  readonly python: PythonIdentity;
   readonly anchors: readonly [string, string, string];
   readonly loopPairs: readonly (readonly [string, string])[];
 }
@@ -17,6 +18,12 @@ export interface ColmapIdentity {
   readonly version: string;
   readonly build: string;
   readonly sha256: string;
+}
+
+export interface PythonIdentity {
+  readonly executable: string;
+  readonly sha256: string;
+  readonly pycolmapVersion: string;
 }
 
 export interface RefinerPreflight {
@@ -39,6 +46,7 @@ export async function preflightRunConfig(
   const loopPairs = parseLoopPairs(raw.loopPairs);
   const configDirectory = dirname(resolve(configPath));
   const colmap = await parseColmapIdentity(raw.colmap, configDirectory);
+  const python = await parsePythonIdentity(raw.python, configDirectory);
   const config: RefinerRunConfig = {
     inputZip: resolve(configDirectory, requiredPath(raw.inputZip, 'inputZip')),
     outputDirectory: resolve(
@@ -46,6 +54,7 @@ export async function preflightRunConfig(
       requiredPath(raw.outputDirectory, 'outputDirectory')
     ),
     colmap,
+    python,
     anchors,
     loopPairs,
   };
@@ -69,6 +78,39 @@ export async function preflightRunConfig(
     inputSha256: createHash('sha256').update(inputZipBytes).digest('hex'),
     sequentialPairs: adjacentImagePairs(
       dataset.model.images.map((image) => image.name)
+    ),
+  };
+}
+
+async function parsePythonIdentity(
+  value: unknown,
+  configDirectory: string
+): Promise<PythonIdentity> {
+  if (!isRecord(value)) {
+    throw new Error('python must define the offline PyCOLMAP runtime.');
+  }
+  const executable = resolve(
+    configDirectory,
+    requiredString(value.executable, 'python.executable')
+  );
+  const sha256 = requiredString(value.sha256, 'python.sha256').toLowerCase();
+  if (!/^[a-f0-9]{64}$/.test(sha256)) {
+    throw new Error('python.sha256 must be a 64-character hexadecimal hash.');
+  }
+  const actualHash = createHash('sha256')
+    .update(await readFile(executable))
+    .digest('hex');
+  if (actualHash !== sha256) {
+    throw new Error(
+      'Python executable SHA-256 does not match the configured identity.'
+    );
+  }
+  return {
+    executable,
+    sha256,
+    pycolmapVersion: requiredString(
+      value.pycolmapVersion,
+      'python.pycolmapVersion'
     ),
   };
 }

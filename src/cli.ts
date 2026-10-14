@@ -10,6 +10,7 @@ import { verifyAndFreezeFeatureDatabase } from './refiner/database-handoff.js';
 import { runExhaustiveMatching } from './refiner/exhaustive-matching.js';
 import { runFixedPoseTriangulation } from './refiner/triangulation.js';
 import { verifyPreBaSupport } from './refiner/pre-ba-support.js';
+import { inspectBundleAdjustment } from './refiner/ba-inspection.js';
 
 type WriteMessage = (message: string) => void;
 
@@ -62,6 +63,8 @@ export async function runRefinerCli(
     writeMessage('Fixed-pose triangulation: complete');
     await verifyPreBaSupport(preflight, run);
     writeMessage('Pre-BA support: verified');
+    await inspectBundleAdjustment(preflight, run, executor);
+    writeMessage('BA configuration: inspected without solving');
     writeMessage('Pipeline execution is not implemented yet.');
     return 1;
   } catch (error) {

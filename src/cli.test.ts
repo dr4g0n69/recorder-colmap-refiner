@@ -256,6 +256,23 @@ describe('runRefinerCli', () => {
     );
   });
 
+  it('rejects an inspection report that claims the solver was called', async () => {
+    const directory = await preparedDirectory();
+    const configPath = await writeConfig(directory, validSelection);
+    const messages: string[] = [];
+
+    const exitCode = await runRefinerCli(
+      ['refine', '--config', configPath],
+      (message) => messages.push(message),
+      successfulColmapExecutor([], { inspectionSolveCalled: true })
+    );
+
+    expect(exitCode).toBe(1);
+    expect(messages.at(-1)).toBe(
+      'Execution error: BA inspection must not call the solver.'
+    );
+  });
+
   it('creates independent immutable records for repeated valid preflights', async () => {
     const directory = await preparedDirectory();
     const selection = validSelection;
@@ -298,6 +315,13 @@ describe('runRefinerCli', () => {
         sha256: createHash('sha256')
           .update(await readFile(join(directory, 'colmap.exe')))
           .digest('hex'),
+      },
+      python: {
+        executable: join(directory, 'python.exe'),
+        sha256: createHash('sha256')
+          .update(await readFile(join(directory, 'python.exe')))
+          .digest('hex'),
+        pycolmapVersion: '4.2.0',
       },
       anchors: selection.anchors,
       loopPairs: selection.loopPairs,
@@ -471,6 +495,32 @@ describe('runRefinerCli', () => {
     expect(
       JSON.parse(
         await readFile(
+          join(runsDirectory, firstRun!, 'evidence', 'ba-inspection.json'),
+          'utf8'
+        )
+      )
+    ).toEqual(
+      expect.objectContaining({
+        schemaVersion: 1,
+        solveCalled: false,
+        pycolmapVersion: '4.2.0',
+        registeredImageCount: 3,
+        fixedFullPoseFrameCount: 3,
+        fixedRotationFrameCount: 3,
+        variableTranslationFrameCount: 0,
+        fixedIntrinsicsCameraCount: 1,
+        linkedObservationCount: 45,
+        scalarReprojectionResidualCount: 90,
+        anchors: [
+          expect.objectContaining({ filename: 'frame-000001.jpg' }),
+          expect.objectContaining({ filename: 'frame-000002.jpg' }),
+          expect.objectContaining({ filename: 'frame-000003.jpg' }),
+        ],
+      })
+    );
+    expect(
+      JSON.parse(
+        await readFile(
           join(runsDirectory, firstRun!, 'evidence', 'database-handoff.json'),
           'utf8'
         )
@@ -546,6 +596,7 @@ describe('runRefinerCli', () => {
       ['exhaustive-matcher', 'exhaustive_matcher'],
       ['point-triangulator', 'point_triangulator'],
       ['model-converter', 'model_converter'],
+      ['ba-inspect', expect.stringMatching(/three-anchor-ba\.py$/)],
     ]);
 
     expect(
@@ -557,21 +608,23 @@ describe('runRefinerCli', () => {
     ).toBe(1);
     expect(await readdir(runsDirectory)).toHaveLength(2);
     expect(await readFile(firstRecordPath)).toEqual(firstRecordBytes);
-    expect(messages).toHaveLength(14);
+    expect(messages).toHaveLength(16);
     expect(messages[0]).toMatch(/^Prepared run: /);
     expect(messages[1]).toBe('Feature extraction: complete');
     expect(messages[2]).toBe('Feature database identity: verified');
     expect(messages[3]).toBe('Exhaustive matching: complete');
     expect(messages[4]).toBe('Fixed-pose triangulation: complete');
     expect(messages[5]).toBe('Pre-BA support: verified');
-    expect(messages[6]).toBe('Pipeline execution is not implemented yet.');
-    expect(messages[7]).toMatch(/^Prepared run: /);
-    expect(messages[8]).toBe('Feature extraction: complete');
-    expect(messages[9]).toBe('Feature database identity: verified');
-    expect(messages[10]).toBe('Exhaustive matching: complete');
-    expect(messages[11]).toBe('Fixed-pose triangulation: complete');
-    expect(messages[12]).toBe('Pre-BA support: verified');
-    expect(messages[13]).toBe('Pipeline execution is not implemented yet.');
+    expect(messages[6]).toBe('BA configuration: inspected without solving');
+    expect(messages[7]).toBe('Pipeline execution is not implemented yet.');
+    expect(messages[8]).toMatch(/^Prepared run: /);
+    expect(messages[9]).toBe('Feature extraction: complete');
+    expect(messages[10]).toBe('Feature database identity: verified');
+    expect(messages[11]).toBe('Exhaustive matching: complete');
+    expect(messages[12]).toBe('Fixed-pose triangulation: complete');
+    expect(messages[13]).toBe('Pre-BA support: verified');
+    expect(messages[14]).toBe('BA configuration: inspected without solving');
+    expect(messages[15]).toBe('Pipeline execution is not implemented yet.');
   });
 });
 
@@ -594,6 +647,7 @@ async function preparedDirectory(): Promise<string> {
   const directory = await temporaryDirectory();
   await writeFile(join(directory, 'capture.zip'), await recorderZip());
   await writeFile(join(directory, 'colmap.exe'), 'fake-colmap');
+  await writeFile(join(directory, 'python.exe'), 'fake-python');
   return directory;
 }
 
@@ -622,6 +676,13 @@ async function writeConfig(
             .update(await readFile(executable))
             .digest('hex'),
       },
+      python: {
+        executable: './python.exe',
+        sha256: createHash('sha256')
+          .update(await readFile(join(directory, 'python.exe')))
+          .digest('hex'),
+        pycolmapVersion: '4.2.0',
+      },
       ...selection,
     })
   );
@@ -636,6 +697,7 @@ function successfulColmapExecutor(
     readonly addMatches?: boolean;
     readonly returnedTranslationX?: number;
     readonly omitLoopMatches?: boolean;
+    readonly inspectionSolveCalled?: boolean;
   } = {}
 ): NativeCommandExecutor {
   const imageNames = options.imageNames ?? [
@@ -658,8 +720,53 @@ function successfulColmapExecutor(
         options.returnedTranslationX ?? 1
       );
     }
+    if (command.stage === 'ba-inspect') {
+      await writeBaInspection(
+        command,
+        options.inspectionSolveCalled === true
+      );
+    }
     return successfulResult('COLMAP 4.2.0 be5e291 (CUDA)');
   };
+}
+
+async function writeBaInspection(
+  command: NativeCommand,
+  solveCalled: boolean
+): Promise<void> {
+  const argument = (name: string) =>
+    command.args[command.args.indexOf(name) + 1]!;
+  await writeFile(
+    join(command.cwd, 'evidence', 'ba-inspection.json'),
+    `${JSON.stringify({
+      schemaVersion: 1,
+      solveCalled,
+      inputSha256: argument('--input-sha256'),
+      preBaSupportSha256: argument('--pre-ba-sha256'),
+      driverSha256: createHash('sha256')
+        .update(await readFile(command.args[0]!))
+        .digest('hex'),
+      pythonVersion: '3.13.7',
+      pythonExecutable: command.executable,
+      pycolmapVersion: argument('--expected-pycolmap-version'),
+      pycolmapModule: 'fake/pycolmap/__init__.py',
+      pycolmapBinaryHashes: { 'fake/_core.pyd': '0'.repeat(64) },
+      registeredImageCount: 3,
+      fixedFullPoseFrameCount: 3,
+      fixedRotationFrameCount: 3,
+      variableTranslationFrameCount: 0,
+      fixedIntrinsicsCameraCount: 1,
+      linkedObservationCount: 45,
+      scalarReprojectionResidualCount: 90,
+      anchors: [
+        { filename: 'frame-000001.jpg', imageId: 20, frameId: 1 },
+        { filename: 'frame-000002.jpg', imageId: 5, frameId: 2 },
+        { filename: 'frame-000003.jpg', imageId: 80, frameId: 3 },
+      ],
+      effectiveConfig: 'three fixed full poses',
+      effectiveOptions: 'fixed rotations and intrinsics',
+    }, null, 2)}\n`
+  );
 }
 
 async function writeTriangulatedText(

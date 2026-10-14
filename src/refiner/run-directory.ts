@@ -24,6 +24,7 @@ export async function createPreparedRun(
     },
     outputDirectory: preflight.config.outputDirectory,
     colmap: preflight.config.colmap,
+    python: preflight.config.python,
     anchors: preflight.config.anchors,
     loopPairs: preflight.config.loopPairs,
     sequentialPairs: preflight.sequentialPairs,
