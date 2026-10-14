@@ -72,7 +72,7 @@ export async function runFixedPoseTriangulation(
   const camerasBytes = await readFile(join(exportDirectory, 'cameras.txt'));
   const imagesBytes = await readFile(join(exportDirectory, 'images.txt'));
   const pointsBytes = await readFile(join(exportDirectory, 'points3D.txt'));
-  const camera = readCamera(camerasBytes.toString());
+  const camera = readWorkingCamera(camerasBytes.toString());
   const images = readWorkingImages(imagesBytes.toString());
   const points = readWorkingPoints(pointsBytes.toString());
 
@@ -150,7 +150,7 @@ export async function runFixedPoseTriangulation(
   );
 }
 
-function readCamera(source: string): {
+export function readWorkingCamera(source: string): {
   readonly cameraId: number;
   readonly width: number;
   readonly height: number;

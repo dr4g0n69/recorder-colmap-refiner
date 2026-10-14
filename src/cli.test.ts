@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import {
+  mkdir,
   mkdtemp,
   readFile,
   readdir,
@@ -273,6 +274,62 @@ describe('runRefinerCli', () => {
     );
   });
 
+  it('permanently records a failed BA attempt without publishing adjusted output', async () => {
+    const directory = await preparedDirectory();
+    const configPath = await writeConfig(directory, validSelection);
+    const messages: string[] = [];
+
+    const exitCode = await runRefinerCli(
+      ['refine', '--config', configPath],
+      (message) => messages.push(message),
+      successfulColmapExecutor([], { failBaSolve: true })
+    );
+
+    expect(exitCode).toBe(1);
+    expect(messages.at(-1)).toBe(
+      'Execution error: ba-solve failed with exit code 2.'
+    );
+    const [run] = await readdir(join(directory, 'runs'));
+    expect(
+      JSON.parse(
+        await readFile(
+          join(directory, 'runs', run!, 'evidence', 'ba-attempt.json'),
+          'utf8'
+        )
+      )
+    ).toEqual(
+      expect.objectContaining({
+        schemaVersion: 1,
+        permanent: true,
+        inputSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+        inspectionSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+      })
+    );
+    await expect(
+      stat(join(directory, 'runs', run!, 'models', 'adjusted'))
+    ).rejects.toThrow();
+    await expect(
+      stat(join(directory, 'runs', run!, 'exports', 'adjusted'))
+    ).rejects.toThrow();
+  });
+
+  it('rejects adjusted output that changes a fixed rotation despite a passing native report', async () => {
+    const directory = await preparedDirectory();
+    const configPath = await writeConfig(directory, validSelection);
+    const messages: string[] = [];
+
+    const exitCode = await runRefinerCli(
+      ['refine', '--config', configPath],
+      (message) => messages.push(message),
+      successfulColmapExecutor([], { adjustedRotationChanged: true })
+    );
+
+    expect(exitCode).toBe(1);
+    expect(messages.at(-1)).toBe(
+      'Execution error: BA adjusted export changed rotation for frame-000002.jpg.'
+    );
+  });
+
   it('creates independent immutable records for repeated valid preflights', async () => {
     const directory = await preparedDirectory();
     const selection = validSelection;
@@ -448,6 +505,26 @@ describe('runRefinerCli', () => {
     expect(
       JSON.parse(
         await readFile(
+          join(runsDirectory, firstRun!, 'evidence', 'ba-result.json'),
+          'utf8'
+        )
+      )
+    ).toEqual(
+      expect.objectContaining({
+        schemaVersion: 1,
+        status: 'pass',
+        solveCalled: true,
+        solutionUsable: true,
+        hardLocks: expect.objectContaining({
+          passed: true,
+          identityUnchanged: true,
+          intrinsicsUnchanged: true,
+        }),
+      })
+    );
+    expect(
+      JSON.parse(
+        await readFile(
           join(runsDirectory, firstRun!, 'metrics', 'pre-ba-support.json'),
           'utf8'
         )
@@ -597,6 +674,7 @@ describe('runRefinerCli', () => {
       ['point-triangulator', 'point_triangulator'],
       ['model-converter', 'model_converter'],
       ['ba-inspect', expect.stringMatching(/three-anchor-ba\.py$/)],
+      ['ba-solve', expect.stringMatching(/three-anchor-ba\.py$/)],
     ]);
 
     expect(
@@ -608,7 +686,6 @@ describe('runRefinerCli', () => {
     ).toBe(1);
     expect(await readdir(runsDirectory)).toHaveLength(2);
     expect(await readFile(firstRecordPath)).toEqual(firstRecordBytes);
-    expect(messages).toHaveLength(16);
     expect(messages[0]).toMatch(/^Prepared run: /);
     expect(messages[1]).toBe('Feature extraction: complete');
     expect(messages[2]).toBe('Feature database identity: verified');
@@ -616,15 +693,18 @@ describe('runRefinerCli', () => {
     expect(messages[4]).toBe('Fixed-pose triangulation: complete');
     expect(messages[5]).toBe('Pre-BA support: verified');
     expect(messages[6]).toBe('BA configuration: inspected without solving');
-    expect(messages[7]).toBe('Pipeline execution is not implemented yet.');
-    expect(messages[8]).toMatch(/^Prepared run: /);
-    expect(messages[9]).toBe('Feature extraction: complete');
-    expect(messages[10]).toBe('Feature database identity: verified');
-    expect(messages[11]).toBe('Exhaustive matching: complete');
-    expect(messages[12]).toBe('Fixed-pose triangulation: complete');
-    expect(messages[13]).toBe('Pre-BA support: verified');
-    expect(messages[14]).toBe('BA configuration: inspected without solving');
-    expect(messages[15]).toBe('Pipeline execution is not implemented yet.');
+    expect(messages[7]).toBe('Three-anchor bundle adjustment: complete');
+    expect(messages[8]).toBe('Pipeline execution is not implemented yet.');
+    expect(messages[9]).toMatch(/^Prepared run: /);
+    expect(messages[10]).toBe('Feature extraction: complete');
+    expect(messages[11]).toBe('Feature database identity: verified');
+    expect(messages[12]).toBe('Exhaustive matching: complete');
+    expect(messages[13]).toBe('Fixed-pose triangulation: complete');
+    expect(messages[14]).toBe('Pre-BA support: verified');
+    expect(messages[15]).toBe('BA configuration: inspected without solving');
+    expect(messages[16]).toBe('Three-anchor bundle adjustment: complete');
+    expect(messages[17]).toBe('Pipeline execution is not implemented yet.');
+    expect(messages).toHaveLength(18);
   });
 });
 
@@ -698,6 +778,8 @@ function successfulColmapExecutor(
     readonly returnedTranslationX?: number;
     readonly omitLoopMatches?: boolean;
     readonly inspectionSolveCalled?: boolean;
+    readonly failBaSolve?: boolean;
+    readonly adjustedRotationChanged?: boolean;
   } = {}
 ): NativeCommandExecutor {
   const imageNames = options.imageNames ?? [
@@ -726,8 +808,103 @@ function successfulColmapExecutor(
         options.inspectionSolveCalled === true
       );
     }
+    if (command.stage === 'ba-solve' && options.failBaSolve === true) {
+      return { exitCode: 2, signal: null, stdout: '', stderr: 'solve failed' };
+    }
+    if (command.stage === 'ba-solve') {
+      await writeBaResult(command, options.adjustedRotationChanged === true);
+    }
     return successfulResult('COLMAP 4.2.0 be5e291 (CUDA)');
   };
+}
+
+async function writeBaResult(
+  command: NativeCommand,
+  adjustedRotationChanged: boolean
+): Promise<void> {
+  const argument = (name: string) =>
+    command.args[command.args.indexOf(name) + 1]!;
+  const modelDirectory = join(command.cwd, 'models', 'adjusted');
+  const exportDirectory = join(command.cwd, 'exports', 'adjusted');
+  await Promise.all([
+    mkdir(modelDirectory),
+    mkdir(exportDirectory),
+  ]);
+  const binaryFilenames = [
+    'cameras.bin',
+    'frames.bin',
+    'images.bin',
+    'points3D.bin',
+    'rigs.bin',
+  ];
+  const textFilenames = ['cameras.txt', 'images.txt', 'points3D.txt'];
+  await Promise.all([
+    ...binaryFilenames.map((filename) =>
+      writeFile(join(modelDirectory, filename), `fake-${filename}`)
+    ),
+    ...textFilenames.map(async (filename) => {
+      const baseline = await readFile(
+        join(command.cwd, 'exports', 'triangulated', filename)
+      );
+      const output =
+        adjustedRotationChanged && filename === 'images.txt'
+          ? baseline
+              .toString()
+              .replace(
+                '5 1 0 0 0 0 0 0 41 frame-000002.jpg',
+                '5 0.7071067811865476 0 0.7071067811865476 0 0 0 0 41 frame-000002.jpg'
+              )
+          : baseline;
+      await writeFile(join(exportDirectory, filename), output);
+    }),
+  ]);
+  const hashes = async (directory: string, filenames: readonly string[]) =>
+    Object.fromEntries(
+      await Promise.all(
+        filenames.map(async (filename) => [
+          filename,
+          createHash('sha256')
+            .update(await readFile(join(directory, filename)))
+            .digest('hex'),
+        ])
+      )
+    );
+  const inspection = JSON.parse(
+    await readFile(join(command.cwd, 'evidence', 'ba-inspection.json'), 'utf8')
+  ) as Record<string, unknown>;
+  await writeFile(
+    argument('--report'),
+    `${JSON.stringify({
+      schemaVersion: 1,
+      status: 'pass',
+      solveCalled: true,
+      solutionUsable: true,
+      inputSha256: argument('--input-sha256'),
+      preBaSha256: argument('--pre-ba-sha256'),
+      inspectionSha256: argument('--inspection-sha256'),
+      attemptSha256: argument('--attempt-sha256'),
+      driverSha256: createHash('sha256')
+        .update(await readFile(command.args[0]!))
+        .digest('hex'),
+      resolvedConfigSha256: argument('--resolved-config-sha256'),
+      pycolmapBinaryHashes: inspection.pycolmapBinaryHashes,
+      effectiveConfig: inspection.effectiveConfig,
+      effectiveOptions: inspection.effectiveOptions,
+      scalarReprojectionResidualCount:
+        inspection.scalarReprojectionResidualCount,
+      hardLocks: {
+        passed: true,
+        identityUnchanged: true,
+        intrinsicsUnchanged: true,
+        maxRotationQuaternionComponentDelta: 0,
+        maxAnchorCentreDelta: 0,
+        maxAnchorTranslationDelta: 0,
+        maxAnchorDistanceDelta: 0,
+      },
+      binaryHashes: await hashes(modelDirectory, binaryFilenames),
+      exportHashes: await hashes(exportDirectory, textFilenames),
+    }, null, 2)}\n`
+  );
 }
 
 async function writeBaInspection(

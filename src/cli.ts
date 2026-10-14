@@ -11,6 +11,7 @@ import { runExhaustiveMatching } from './refiner/exhaustive-matching.js';
 import { runFixedPoseTriangulation } from './refiner/triangulation.js';
 import { verifyPreBaSupport } from './refiner/pre-ba-support.js';
 import { inspectBundleAdjustment } from './refiner/ba-inspection.js';
+import { runBundleAdjustment } from './refiner/ba-solve.js';
 
 type WriteMessage = (message: string) => void;
 
@@ -65,6 +66,8 @@ export async function runRefinerCli(
     writeMessage('Pre-BA support: verified');
     await inspectBundleAdjustment(preflight, run, executor);
     writeMessage('BA configuration: inspected without solving');
+    await runBundleAdjustment(preflight, run, executor);
+    writeMessage('Three-anchor bundle adjustment: complete');
     writeMessage('Pipeline execution is not implemented yet.');
     return 1;
   } catch (error) {
