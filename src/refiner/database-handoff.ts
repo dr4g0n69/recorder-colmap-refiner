@@ -5,6 +5,7 @@ import { join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
 import type { PinholeCamera } from '../colmap/model.js';
+import { serializeRecorderColmapText } from '../colmap/text-codec.js';
 import type { RefinerPreflight } from './preflight.js';
 import type { PreparedRun } from './run-directory.js';
 
@@ -27,6 +28,8 @@ export async function verifyAndFreezeFeatureDatabase(
   if ((await fileSha256(featuresPath)) !== beforeSha256) {
     throw new Error('features.db changed during read-only verification.');
   }
+
+  await materializeKnownModel(preflight, run, database, images);
 
   await copyFile(featuresPath, exhaustivePath, constants.COPYFILE_EXCL);
   const exhaustiveSha256 = await fileSha256(exhaustivePath);
@@ -55,6 +58,64 @@ export async function verifyAndFreezeFeatureDatabase(
     )}\n`,
     { flag: 'wx' }
   );
+}
+
+async function materializeKnownModel(
+  preflight: RefinerPreflight,
+  run: PreparedRun,
+  database: {
+    readonly cameras: readonly PinholeCamera[];
+    readonly images: readonly DatabaseImage[];
+  },
+  mapping: readonly {
+    readonly originalImageId: number;
+    readonly imageName: string;
+    readonly databaseImageId: number;
+    readonly originalCameraId: number;
+    readonly databaseCameraId: number;
+  }[]
+): Promise<void> {
+  const byName = new Map(mapping.map((image) => [image.imageName, image]));
+  const knownModel = {
+    cameras: database.cameras,
+    images: preflight.dataset.model.images.map((image) => {
+      const mapped = byName.get(image.name)!;
+      return {
+        ...image,
+        imageId: mapped.databaseImageId,
+        cameraId: mapped.databaseCameraId,
+        observations: [],
+      };
+    }),
+    points3D: [],
+  } as const;
+  const text = serializeRecorderColmapText(knownModel);
+  const knownDirectory = join(run.runDirectory, 'models', 'known');
+  await Promise.all([
+    writeFile(join(knownDirectory, 'cameras.txt'), text.cameras, { flag: 'wx' }),
+    writeFile(join(knownDirectory, 'images.txt'), text.images, { flag: 'wx' }),
+    writeFile(join(knownDirectory, 'points3D.txt'), text.points3D, {
+      flag: 'wx',
+    }),
+    writeFile(
+      join(run.runDirectory, 'poses.json'),
+      `${JSON.stringify(
+        {
+          schemaVersion: 1,
+          images: preflight.dataset.model.images.map((image) => ({
+            originalImageId: image.imageId,
+            imageName: image.name,
+            cameraId: image.cameraId,
+            qvec: image.pose.qvec,
+            tvec: image.pose.tvec,
+          })),
+        },
+        null,
+        2
+      )}\n`,
+      { flag: 'wx' }
+    ),
+  ]);
 }
 
 function readFeatureDatabase(path: string): {

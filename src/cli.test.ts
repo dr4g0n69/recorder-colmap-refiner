@@ -165,11 +165,13 @@ describe('runRefinerCli', () => {
     const exitCode = await runRefinerCli(
       ['refine', '--config', configPath],
       (message) => messages.push(message),
-      successfulColmapExecutor(calls, [
-        'Frame-000001.jpg',
-        'frame-000002.jpg',
-        'frame-000003.jpg',
-      ])
+      successfulColmapExecutor(calls, {
+        imageNames: [
+          'Frame-000001.jpg',
+          'frame-000002.jpg',
+          'frame-000003.jpg',
+        ],
+      })
     );
 
     expect(exitCode).toBe(1);
@@ -190,7 +192,7 @@ describe('runRefinerCli', () => {
     const exitCode = await runRefinerCli(
       ['refine', '--config', configPath],
       (message) => messages.push(message),
-      successfulColmapExecutor([], undefined, [501, 500, 320, 240])
+      successfulColmapExecutor([], { cameraParams: [501, 500, 320, 240] })
     );
 
     expect(exitCode).toBe(1);
@@ -211,12 +213,29 @@ describe('runRefinerCli', () => {
     const exitCode = await runRefinerCli(
       ['refine', '--config', configPath],
       (message) => messages.push(message),
-      successfulColmapExecutor([], undefined, undefined, false)
+      successfulColmapExecutor([], { addMatches: false })
     );
 
     expect(exitCode).toBe(1);
     expect(messages.at(-1)).toBe(
       'Execution error: exhaustive matcher added no verified correspondences.'
+    );
+  });
+
+  it('rejects a fixed-pose triangulation result that changes a recorder pose', async () => {
+    const directory = await preparedDirectory();
+    const configPath = await writeConfig(directory, validSelection);
+    const messages: string[] = [];
+
+    const exitCode = await runRefinerCli(
+      ['refine', '--config', configPath],
+      (message) => messages.push(message),
+      successfulColmapExecutor([], { returnedTranslationX: 1 })
+    );
+
+    expect(exitCode).toBe(1);
+    expect(messages.at(-1)).toBe(
+      'Execution error: triangulation changed pose for frame-000001.jpg.'
     );
   });
 
@@ -294,10 +313,17 @@ describe('runRefinerCli', () => {
       points3D: await readFile(join(knownDirectory, 'points3D.txt')),
     });
     expect(knownModel.cameras).toHaveLength(1);
+    expect(knownModel.cameras[0]!.cameraId).toBe(41);
     expect(knownModel.images.map((image) => image.name)).toEqual([
       'frame-000001.jpg',
       'frame-000002.jpg',
       'frame-000003.jpg',
+    ]);
+    expect(knownModel.images.map((image) => image.imageId)).toEqual([
+      20, 5, 80,
+    ]);
+    expect(knownModel.images.map((image) => image.cameraId)).toEqual([
+      41, 41, 41,
     ]);
     expect(
       knownModel.images.every((image) => image.observations.length === 0)
@@ -434,11 +460,28 @@ describe('runRefinerCli', () => {
       })
     );
     expect(
+      JSON.parse(
+        await readFile(
+          join(runsDirectory, firstRun!, 'evidence', 'triangulation.json'),
+          'utf8'
+        )
+      )
+    ).toEqual(
+      expect.objectContaining({
+        schemaVersion: 1,
+        imageCount: 3,
+        observationCount: 6,
+        pointCount: 2,
+      })
+    );
+    expect(
       calls.map((command) => [command.stage, command.args[0]])
     ).toEqual([
       ['colmap-identity', '-h'],
       ['feature-extractor', 'feature_extractor'],
       ['exhaustive-matcher', 'exhaustive_matcher'],
+      ['point-triangulator', 'point_triangulator'],
+      ['model-converter', 'model_converter'],
     ]);
 
     expect(
@@ -450,17 +493,19 @@ describe('runRefinerCli', () => {
     ).toBe(1);
     expect(await readdir(runsDirectory)).toHaveLength(2);
     expect(await readFile(firstRecordPath)).toEqual(firstRecordBytes);
-    expect(messages).toHaveLength(10);
+    expect(messages).toHaveLength(12);
     expect(messages[0]).toMatch(/^Prepared run: /);
     expect(messages[1]).toBe('Feature extraction: complete');
     expect(messages[2]).toBe('Feature database identity: verified');
     expect(messages[3]).toBe('Exhaustive matching: complete');
-    expect(messages[4]).toBe('Pipeline execution is not implemented yet.');
-    expect(messages[5]).toMatch(/^Prepared run: /);
-    expect(messages[6]).toBe('Feature extraction: complete');
-    expect(messages[7]).toBe('Feature database identity: verified');
-    expect(messages[8]).toBe('Exhaustive matching: complete');
-    expect(messages[9]).toBe('Pipeline execution is not implemented yet.');
+    expect(messages[4]).toBe('Fixed-pose triangulation: complete');
+    expect(messages[5]).toBe('Pipeline execution is not implemented yet.');
+    expect(messages[6]).toMatch(/^Prepared run: /);
+    expect(messages[7]).toBe('Feature extraction: complete');
+    expect(messages[8]).toBe('Feature database identity: verified');
+    expect(messages[9]).toBe('Exhaustive matching: complete');
+    expect(messages[10]).toBe('Fixed-pose triangulation: complete');
+    expect(messages[11]).toBe('Pipeline execution is not implemented yet.');
   });
 });
 
@@ -519,26 +564,66 @@ async function writeConfig(
 
 function successfulColmapExecutor(
   calls: NativeCommand[],
-  imageNames: readonly string[] = [
+  options: {
+    readonly imageNames?: readonly string[];
+    readonly cameraParams?: readonly [number, number, number, number];
+    readonly addMatches?: boolean;
+    readonly returnedTranslationX?: number;
+  } = {}
+): NativeCommandExecutor {
+  const imageNames = options.imageNames ?? [
     'frame-000001.jpg',
     'frame-000002.jpg',
     'frame-000003.jpg',
-  ],
-  cameraParams: readonly [number, number, number, number] = [
-    500, 500, 320, 240,
-  ],
-  addMatches = true
-): NativeCommandExecutor {
+  ];
+  const cameraParams = options.cameraParams ?? [500, 500, 320, 240];
   return async (command) => {
     calls.push(command);
     if (command.stage === 'feature-extractor') {
       writeFeaturesDatabase(command.cwd, imageNames, cameraParams);
     }
-    if (command.stage === 'exhaustive-matcher' && addMatches) {
+    if (command.stage === 'exhaustive-matcher' && options.addMatches !== false) {
       writeMatchRows(command.cwd);
+    }
+    if (command.stage === 'model-converter') {
+      await writeTriangulatedText(
+        command.cwd,
+        options.returnedTranslationX ?? 0
+      );
     }
     return successfulResult('COLMAP 4.2.0 be5e291 (CUDA)');
   };
+}
+
+async function writeTriangulatedText(
+  runDirectory: string,
+  returnedTranslationX: number
+): Promise<void> {
+  const directory = join(runDirectory, 'exports', 'triangulated');
+  await writeFile(
+    join(directory, 'cameras.txt'),
+    '41 PINHOLE 640 480 500 500 320 240\n'
+  );
+  await writeFile(
+    join(directory, 'images.txt'),
+    [
+      `20 1 0 0 0 ${returnedTranslationX} 0 0 41 frame-000001.jpg`,
+      '10 10 1 20 20 2',
+      '5 1 0 0 0 0 0 0 41 frame-000002.jpg',
+      '11 10 1 21 20 2',
+      '80 1 0 0 0 0 0 0 41 frame-000003.jpg',
+      '12 10 1 22 20 2',
+      '',
+    ].join('\n')
+  );
+  await writeFile(
+    join(directory, 'points3D.txt'),
+    [
+      '1 0 0 1 255 0 0 0.1 20 0 5 0 80 0',
+      '2 1 0 1 0 255 0 0.2 20 1 5 1 80 1',
+      '',
+    ].join('\n')
+  );
 }
 
 function writeFeaturesDatabase(

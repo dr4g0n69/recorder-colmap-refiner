@@ -8,6 +8,7 @@ import {
 import { runFeatureExtraction } from './refiner/feature-extraction.js';
 import { verifyAndFreezeFeatureDatabase } from './refiner/database-handoff.js';
 import { runExhaustiveMatching } from './refiner/exhaustive-matching.js';
+import { runFixedPoseTriangulation } from './refiner/triangulation.js';
 
 type WriteMessage = (message: string) => void;
 
@@ -56,6 +57,8 @@ export async function runRefinerCli(
     writeMessage('Feature database identity: verified');
     await runExhaustiveMatching(preflight, run, executor);
     writeMessage('Exhaustive matching: complete');
+    await runFixedPoseTriangulation(preflight, run, executor);
+    writeMessage('Fixed-pose triangulation: complete');
     writeMessage('Pipeline execution is not implemented yet.');
     return 1;
   } catch (error) {
