@@ -17,6 +17,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import { runRefinerCli } from './cli.js';
 import { parseRecorderColmapText } from './colmap/text-codec.js';
+import { acceptancePolicy } from './refiner/acceptance-policy.js';
 import type {
   NativeCommand,
   NativeCommandExecutor,
@@ -219,8 +220,25 @@ describe('runRefinerCli', () => {
 
     expect(exitCode).toBe(1);
     expect(messages.at(-1)).toBe(
-      'Execution error: exhaustive matcher added no verified correspondences.'
+      'Execution error: matcher added no verified correspondences.'
     );
+  });
+
+  it('falls back to a clean selected-pair database when exhaustive matching fails', async () => {
+    const directory = await preparedDirectory();
+    const configPath = await writeConfig(directory, validSelection);
+    const calls: NativeCommand[] = [];
+
+    await runRefinerCli(
+      ['refine', '--config', configPath],
+      () => undefined,
+      successfulColmapExecutor(calls, { failExhaustiveMatching: true })
+    );
+
+    expect(calls.map((command) => command.stage)).toContain('selected-matcher');
+    expect(
+      calls.find((command) => command.stage === 'point-triangulator')?.args
+    ).toContain('database/selected.db');
   });
 
   it('rejects a fixed-pose triangulation result that changes a recorder pose', async () => {
@@ -274,6 +292,36 @@ describe('runRefinerCli', () => {
     );
   });
 
+  it('stops as inconclusive before reserving BA when identity proof is unavailable', async () => {
+    const directory = await preparedDirectory();
+    const configPath = await writeConfig(directory, validSelection);
+    const calls: NativeCommand[] = [];
+
+    const exitCode = await runRefinerCli(
+      ['refine', '--config', configPath],
+      () => undefined,
+      successfulColmapExecutor(calls, { unavailableIdentityProof: true })
+    );
+
+    expect(exitCode).toBe(1);
+    expect(calls.map((command) => command.stage)).toContain('ba-inspect');
+    expect(calls.map((command) => command.stage)).not.toContain('ba-solve');
+    const [run] = await readdir(join(directory, 'runs'));
+    const runDirectory = join(directory, 'runs', run!);
+    expect(
+      JSON.parse(await readFile(join(runDirectory, 'run-result.json'), 'utf8'))
+    ).toEqual(
+      expect.objectContaining({
+        stage: 'ba-inspection',
+        outcome: 'Inconclusive',
+        reason: 'Native residual-identity evidence is unavailable.',
+      })
+    );
+    await expect(
+      stat(join(runDirectory, 'evidence', 'ba-attempt.json'))
+    ).rejects.toThrow();
+  });
+
   it('permanently records a failed BA attempt without publishing adjusted output', async () => {
     const directory = await preparedDirectory();
     const configPath = await writeConfig(directory, validSelection);
@@ -305,6 +353,28 @@ describe('runRefinerCli', () => {
         inspectionSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
       })
     );
+    expect(
+      JSON.parse(
+        await readFile(
+          join(directory, 'runs', run!, 'run-result.json'),
+          'utf8'
+        )
+      )
+    ).toEqual(
+      expect.objectContaining({
+        stage: 'bundle-adjustment',
+        outcome: 'Failed',
+        reason: 'ba-solve failed with exit code 2.',
+      })
+    );
+    expect(
+      JSON.parse(
+        await readFile(
+          join(directory, 'runs', run!, 'evidence', 'ba-native-start.json'),
+          'utf8'
+        )
+      )
+    ).toEqual(expect.objectContaining({ permanent: true }));
     await expect(
       stat(join(directory, 'runs', run!, 'models', 'adjusted'))
     ).rejects.toThrow();
@@ -439,7 +509,7 @@ describe('runRefinerCli', () => {
           imageName: 'frame-000001.jpg',
           cameraId: 1,
           qvec: [1, 0, 0, 0],
-          tvec: [1, 0, 0],
+          tvec: [0.4, 0, 0],
         },
         {
           originalImageId: 2,
@@ -453,7 +523,7 @@ describe('runRefinerCli', () => {
           imageName: 'frame-000003.jpg',
           cameraId: 1,
           qvec: [1, 0, 0, 0],
-          tvec: [-1, 0, 0],
+          tvec: [-0.4, 0, 0],
         },
       ],
     });
@@ -463,7 +533,6 @@ describe('runRefinerCli', () => {
       'models/adjusted',
       'exports/triangulated',
       'exports/adjusted',
-      'output',
       'logs',
       'metrics',
       'evidence',
@@ -533,16 +602,7 @@ describe('runRefinerCli', () => {
       expect.objectContaining({
         schemaVersion: 1,
         status: 'pass',
-        policy: {
-          minVerifiedMatches: 15,
-          minUsableTracks: 10,
-          minUsableObservations: 20,
-          minParallaxDegrees: 1.5,
-          depthEpsilon: 0.000001,
-          coverageGridRows: 10,
-          coverageGridColumns: 10,
-          minCoverageEachImage: 0.05,
-        },
+        policy: acceptancePolicy,
         connectedComponents: [
           [
             'frame-000001.jpg',
@@ -707,7 +767,7 @@ describe('runRefinerCli', () => {
     expect(messages[0]).toMatch(/^Prepared run: /);
     expect(messages[1]).toBe('Feature extraction: complete');
     expect(messages[2]).toBe('Feature database identity: verified');
-    expect(messages[3]).toBe('Exhaustive matching: complete');
+    expect(messages[3]).toBe('Matching: complete (database/exhaustive.db)');
     expect(messages[4]).toBe('Fixed-pose triangulation: complete');
     expect(messages[5]).toBe('Pre-BA support: verified');
     expect(messages[6]).toBe('BA configuration: inspected without solving');
@@ -717,7 +777,7 @@ describe('runRefinerCli', () => {
     expect(messages[10]).toMatch(/^Prepared run: /);
     expect(messages[11]).toBe('Feature extraction: complete');
     expect(messages[12]).toBe('Feature database identity: verified');
-    expect(messages[13]).toBe('Exhaustive matching: complete');
+    expect(messages[13]).toBe('Matching: complete (database/exhaustive.db)');
     expect(messages[14]).toBe('Fixed-pose triangulation: complete');
     expect(messages[15]).toBe('Pre-BA support: verified');
     expect(messages[16]).toBe('BA configuration: inspected without solving');
@@ -800,6 +860,8 @@ function successfulColmapExecutor(
     readonly inspectionSolveCalled?: boolean;
     readonly failBaSolve?: boolean;
     readonly adjustedRotationChanged?: boolean;
+    readonly failExhaustiveMatching?: boolean;
+    readonly unavailableIdentityProof?: boolean;
   } = {}
 ): NativeCommandExecutor {
   const imageNames = options.imageNames ?? [
@@ -813,29 +875,60 @@ function successfulColmapExecutor(
     if (command.stage === 'feature-extractor') {
       writeFeaturesDatabase(command.cwd, imageNames, cameraParams);
     }
-    if (command.stage === 'exhaustive-matcher' && options.addMatches !== false) {
-      writeMatchRows(command.cwd, options.omitLoopMatches === true);
+    if (
+      command.stage === 'exhaustive-matcher' &&
+      options.failExhaustiveMatching === true
+    ) {
+      return { exitCode: 1, signal: null, stdout: '', stderr: 'timed out' };
+    }
+    if (
+      (command.stage === 'exhaustive-matcher' ||
+        command.stage === 'selected-matcher') &&
+      options.addMatches !== false
+    ) {
+      writeMatchRows(
+        command.cwd,
+        options.omitLoopMatches === true,
+        command.stage === 'selected-matcher' ? 'selected.db' : 'exhaustive.db'
+      );
+    }
+    if (command.stage === 'point-triangulator') {
+      await writeTriangulatedBinary(command.cwd);
     }
     if (command.stage === 'model-converter') {
       await writeTriangulatedText(
         command.cwd,
-        options.returnedTranslationX ?? 1
+        options.returnedTranslationX ?? 0.4
       );
     }
     if (command.stage === 'ba-inspect') {
       await writeBaInspection(
         command,
-        options.inspectionSolveCalled === true
+        options.inspectionSolveCalled === true,
+        options.unavailableIdentityProof === true
       );
     }
-    if (command.stage === 'ba-solve' && options.failBaSolve === true) {
-      return { exitCode: 2, signal: null, stdout: '', stderr: 'solve failed' };
-    }
     if (command.stage === 'ba-solve') {
+      await writeNativeStart(command);
+      if (options.failBaSolve === true) {
+        return { exitCode: 2, signal: null, stdout: '', stderr: 'solve failed' };
+      }
       await writeBaResult(command, options.adjustedRotationChanged === true);
     }
     return successfulResult('COLMAP 4.2.0 be5e291 (CUDA)');
   };
+}
+
+async function writeTriangulatedBinary(runDirectory: string): Promise<void> {
+  await Promise.all(
+    ['cameras.bin', 'frames.bin', 'images.bin', 'points3D.bin', 'rigs.bin'].map(
+      (filename) =>
+        writeFile(
+          join(runDirectory, 'models', 'triangulated', filename),
+          `fake-${filename}`
+        )
+    )
+  );
 }
 
 async function writeBaResult(
@@ -892,6 +985,9 @@ async function writeBaResult(
   const inspection = JSON.parse(
     await readFile(join(command.cwd, 'evidence', 'ba-inspection.json'), 'utf8')
   ) as Record<string, unknown>;
+  const nativeStart = await readFile(
+    join(command.cwd, 'evidence', 'ba-native-start.json')
+  );
   await writeFile(
     argument('--report'),
     `${JSON.stringify({
@@ -910,6 +1006,11 @@ async function writeBaResult(
       pycolmapBinaryHashes: inspection.pycolmapBinaryHashes,
       effectiveConfig: inspection.effectiveConfig,
       effectiveOptions: inspection.effectiveOptions,
+      optimizationInputs: inspection.optimizationInputs,
+      residualSelection: inspection.residualSelection,
+      nativeStartSha256: createHash('sha256')
+        .update(nativeStart)
+        .digest('hex'),
       scalarReprojectionResidualCount:
         inspection.scalarReprojectionResidualCount,
       hardLocks: {
@@ -927,12 +1028,33 @@ async function writeBaResult(
   );
 }
 
+async function writeNativeStart(command: NativeCommand): Promise<void> {
+  const argument = (name: string) =>
+    command.args[command.args.indexOf(name) + 1]!;
+  await writeFile(
+    join(command.cwd, 'evidence', 'ba-native-start.json'),
+    JSON.stringify({
+      schemaVersion: 1,
+      permanent: true,
+      attemptSha256: argument('--attempt-sha256'),
+      inspectionSha256: argument('--inspection-sha256'),
+    })
+  );
+}
+
 async function writeBaInspection(
   command: NativeCommand,
-  solveCalled: boolean
+  solveCalled: boolean,
+  unavailableIdentityProof = false
 ): Promise<void> {
   const argument = (name: string) =>
     command.args[command.args.indexOf(name) + 1]!;
+  const preBa = JSON.parse(
+    await readFile(
+      join(command.cwd, 'metrics', 'pre-ba-support.json'),
+      'utf8'
+    )
+  ) as Record<string, unknown>;
   await writeFile(
     join(command.cwd, 'evidence', 'ba-inspection.json'),
     `${JSON.stringify({
@@ -955,6 +1077,35 @@ async function writeBaInspection(
       fixedIntrinsicsCameraCount: 1,
       linkedObservationCount: 45,
       scalarReprojectionResidualCount: 90,
+      optimizationInputs: preBa.bindings,
+      residualSelection: {
+        method: 'pycolmap-config-num-residuals-v2',
+        nativeApi: 'BundleAdjustmentConfig.num_residuals',
+        configuredImageIds: [5, 20, 80],
+        reconstructionImageIds: [5, 20, 80],
+        linkedObservationCount: 45,
+        expectedScalarResidualCount: 90,
+        nativeScalarResidualCount: 90,
+        identityProof: {
+          ...(unavailableIdentityProof
+            ? {
+                status: 'unavailable',
+                reason: 'native runtime exposes counts only',
+              }
+            : {
+                status: 'verified',
+                method: 'native-residual-identity-inventory-v1',
+                pycolmapBinaryHashes: { 'fake/_core.pyd': '0'.repeat(64) },
+              }),
+        },
+        observationIdentities: [20, 5, 80].flatMap((imageId) =>
+          Array.from({ length: 15 }, (_, point2DIndex) => ({
+            imageId,
+            point2DIndex,
+            point3DId: point2DIndex + 1,
+          }))
+        ),
+      },
       anchors: [
         { filename: 'frame-000001.jpg', imageId: 20, frameId: 1 },
         { filename: 'frame-000002.jpg', imageId: 5, frameId: 2 },
@@ -982,7 +1133,7 @@ async function writeTriangulatedText(
       observationsFor(20),
       '5 1 0 0 0 0 0 0 41 frame-000002.jpg',
       observationsFor(5),
-      '80 1 0 0 0 -1 0 0 41 frame-000003.jpg',
+      '80 1 0 0 0 -0.4 0 0 41 frame-000003.jpg',
       observationsFor(80),
       '',
     ].join('\n')
@@ -996,7 +1147,7 @@ async function writeTriangulatedText(
 }
 
 function observationsFor(imageId: 20 | 5 | 80): string {
-  const translation = imageId === 20 ? 1 : imageId === 80 ? -1 : 0;
+  const translation = imageId === 20 ? 0.4 : imageId === 80 ? -0.4 : 0;
   return Array.from({ length: 15 }, (_, index) => {
     const [x, y, z] = pointFor(index);
     return `${500 * ((x + translation) / z) + 320} ${500 * (y / z) + 240} ${index + 1}`;
@@ -1036,7 +1187,7 @@ function writeFeaturesDatabase(
       const keypoints = Buffer.alloc(15 * 2 * 4);
       for (let index = 0; index < 15; index++) {
         const [x, y, z] = pointFor(index);
-        const translation = imageId === 20 ? 1 : imageId === 80 ? -1 : 0;
+        const translation = imageId === 20 ? 0.4 : imageId === 80 ? -0.4 : 0;
         keypoints.writeFloatLE(
           500 * ((x + translation) / z) + 320,
           index * 8
@@ -1052,9 +1203,13 @@ function writeFeaturesDatabase(
   }
 }
 
-function writeMatchRows(runDirectory: string, omitLoopMatches: boolean): void {
+function writeMatchRows(
+  runDirectory: string,
+  omitLoopMatches: boolean,
+  filename: string
+): void {
   const database = new DatabaseSync(
-    join(runDirectory, 'database', 'exhaustive.db')
+    join(runDirectory, 'database', filename)
   );
   try {
     for (const [first, second] of [
@@ -1104,11 +1259,11 @@ async function recorderZip(): Promise<Uint8Array> {
     'sparse/0/images.txt',
     encoder.encode(
       [
-        '1 1 0 0 0 1 0 0 1 frame-000001.jpg',
+        '1 1 0 0 0 0.4 0 0 1 frame-000001.jpg',
         '',
         '2 1 0 0 0 0 0 0 1 frame-000002.jpg',
         '',
-        '3 1 0 0 0 -1 0 0 1 frame-000003.jpg',
+        '3 1 0 0 0 -0.4 0 0 1 frame-000003.jpg',
         '',
       ].join('\n')
     )

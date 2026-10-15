@@ -13,7 +13,6 @@ const workspaceDirectories = [
   'models/known',
   'models/triangulated',
   'exports/triangulated',
-  'output',
   'logs',
   'metrics',
   'evidence',

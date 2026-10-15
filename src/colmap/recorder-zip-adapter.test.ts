@@ -142,6 +142,27 @@ describe('recorderZipAdapter.open', () => {
     expect(error).toMatchObject({ kind: 'archive' });
     expect(error.cause).toBeDefined();
   });
+
+  test('rejects an entry whose payload no longer matches its ZIP checksum', async () => {
+    const cameras = '1 PINHOLE 640 480 500 500 320 240\n';
+    const entries = validEntries.map((entry) =>
+      entry.path === 'sparse/0/cameras.txt'
+        ? file(entry.path, cameras)
+        : entry
+    );
+    const corrupted = replaceStoredPayload(
+      await buildZip(entries, 0),
+      ' 500 500 ',
+      ' 900 500 '
+    );
+
+    const error = await caught(recorderZipAdapter.open(corrupted));
+
+    expect(error).toMatchObject({
+      kind: 'archive',
+      path: 'sparse/0/cameras.txt',
+    });
+  });
 });
 
 describe('recorderZipAdapter.resolveImages', () => {
@@ -258,16 +279,36 @@ function image(imageId: number, name: string): ColmapImage {
   };
 }
 
-async function buildZip(entries: readonly ArchiveEntry[]): Promise<Uint8Array> {
+async function buildZip(
+  entries: readonly ArchiveEntry[],
+  level?: 0
+): Promise<Uint8Array> {
   const writer = new ZipWriter(new Uint8ArrayWriter());
   for (const entry of entries) {
     if (entry.kind === 'directory') {
       await writer.add(entry.path, undefined, { directory: true });
     } else {
-      await writer.add(entry.path, new Uint8ArrayReader(entry.bytes));
+      await writer.add(entry.path, new Uint8ArrayReader(entry.bytes), { level });
     }
   }
   return writer.close();
+}
+
+function replaceStoredPayload(
+  zipBytes: Uint8Array,
+  sourceText: string,
+  replacementText: string
+): Uint8Array {
+  const source = encoder.encode(sourceText);
+  const replacement = encoder.encode(replacementText);
+  expect(replacement).toHaveLength(source.length);
+  const index = zipBytes.findIndex((_, start) =>
+    source.every((byte, offset) => zipBytes[start + offset] === byte)
+  );
+  expect(index).toBeGreaterThanOrEqual(0);
+  const patched = zipBytes.slice();
+  patched.set(replacement, index);
+  return patched;
 }
 
 async function buildZipWithPatchedFilePath(path: string): Promise<Uint8Array> {

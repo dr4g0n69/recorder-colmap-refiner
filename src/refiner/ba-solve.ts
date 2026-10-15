@@ -104,6 +104,45 @@ export async function runBundleAdjustment(
     6
   );
 
+  await verifyBundleAdjustmentEvidence(preflight, run);
+}
+
+export async function verifyBundleAdjustmentEvidence(
+  preflight: RefinerPreflight,
+  run: PreparedRun,
+  verifyModel = true
+): Promise<Record<string, unknown>> {
+  const preBaPath = join(run.runDirectory, 'metrics', 'pre-ba-support.json');
+  const inspectionPath = join(run.runDirectory, 'evidence', 'ba-inspection.json');
+  const attemptPath = join(run.runDirectory, 'evidence', 'ba-attempt.json');
+  const reportPath = join(run.runDirectory, 'evidence', 'ba-result.json');
+  const nativeStartPath = join(
+    run.runDirectory,
+    'evidence',
+    'ba-native-start.json'
+  );
+  const [
+    preBaBytes,
+    inspectionBytes,
+    attemptBytes,
+    driverBytes,
+    resolvedConfigBytes,
+  ] = await Promise.all([
+    readFile(preBaPath),
+    readFile(inspectionPath),
+    readFile(attemptPath),
+    readFile(driverPath),
+    readFile(run.resolvedConfigPath),
+  ]);
+  const binding = {
+    inputSha256: preflight.inputSha256,
+    preBaSha256: sha256(preBaBytes),
+    inspectionSha256: sha256(inspectionBytes),
+    driverSha256: sha256(driverBytes),
+    resolvedConfigSha256: sha256(resolvedConfigBytes),
+    attemptSha256: sha256(attemptBytes),
+  };
+
   const report: unknown = JSON.parse(await readFile(reportPath, 'utf8'));
   if (!isRecord(report) || !isRecord(report.hardLocks)) {
     throw new Error('BA result must be a JSON object with hard-lock evidence.');
@@ -118,7 +157,7 @@ export async function runBundleAdjustment(
     report.inspectionSha256 !== binding.inspectionSha256 ||
     report.driverSha256 !== binding.driverSha256 ||
     report.resolvedConfigSha256 !== binding.resolvedConfigSha256 ||
-    report.attemptSha256 !== attemptSha256
+    report.attemptSha256 !== binding.attemptSha256
   ) {
     throw new Error('BA result is failed, stale, or bound to different inputs.');
   }
@@ -129,10 +168,20 @@ export async function runBundleAdjustment(
       inspection.scalarReprojectionResidualCount ||
     report.effectiveConfig !== inspection.effectiveConfig ||
     report.effectiveOptions !== inspection.effectiveOptions ||
+    JSON.stringify(report.optimizationInputs) !==
+      JSON.stringify(inspection.optimizationInputs) ||
+    JSON.stringify(report.residualSelection) !==
+      JSON.stringify(inspection.residualSelection) ||
     JSON.stringify(report.pycolmapBinaryHashes) !==
       JSON.stringify(inspection.pycolmapBinaryHashes)
   ) {
     throw new Error('BA execution differs from the inspected problem.');
+  }
+  if (
+    typeof report.nativeStartSha256 !== 'string' ||
+    report.nativeStartSha256 !== sha256(await readFile(nativeStartPath))
+  ) {
+    throw new Error('BA native-start marker is missing or stale.');
   }
   const locks = report.hardLocks;
   if (
@@ -156,7 +205,8 @@ export async function runBundleAdjustment(
     report.exportHashes,
     textFiles
   );
-  await verifyAdjustedModel(preflight, run);
+  if (verifyModel) await verifyAdjustedModel(preflight, run);
+  return report;
 }
 
 async function verifyAdjustedModel(

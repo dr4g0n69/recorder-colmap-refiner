@@ -1,9 +1,11 @@
 import { createHash } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { isAbsolute, join, relative, resolve } from 'node:path';
 
 import type { RefinerPreflight } from './preflight.js';
 import type { PreparedRun } from './run-directory.js';
+import { acceptancePolicy as policy } from './acceptance-policy.js';
+import { verifyBundleAdjustmentEvidence } from './ba-solve.js';
 import {
   readWorkingCamera,
   readWorkingImages,
@@ -12,33 +14,9 @@ import {
   type WorkingPoint,
 } from './triangulation.js';
 
-const policy = {
-  version: 'team6-post-ba-v1',
-  protectedGeometryVersion: 'protected-geometry-v1',
-  numericEpsilon: 1e-7,
-  quaternionTolerance: 1e-6,
-  minVerifiedMatches: 15,
-  minUsableTracks: 10,
-  minUsableObservations: 20,
-  minParallaxDegrees: 1.5,
-  minPositiveDepthRatio: 0.7,
-  depthEpsilon: 1e-6,
-  inlierThresholdPx: 15,
-  coverageGridRows: 10,
-  coverageGridColumns: 10,
-  minCoverageEachImage: 0.05,
-  improvementTolerancePx: 0,
-  pairMedianRegressionPx: 1,
-  pairP90RegressionPx: 2,
-  maxInlierRatioDrop: 0.1,
-  maxCoverageDrop: 0.1,
-  scaleTolerance: 0.01,
-  maxCentreDelta: 0.55,
-  maxSequentialStep: 0.8,
-  maxSequentialTurnDegrees: 45,
-} as const;
-
 export type PostBaVerdict = 'Pass' | 'Rejected' | 'Inconclusive';
+
+class CandidateViolationError extends Error {}
 
 interface FrozenPair {
   readonly images: readonly [string, string];
@@ -51,10 +29,20 @@ interface FrozenMatch {
   readonly xy: readonly [readonly [number, number], readonly [number, number]];
 }
 
+export interface BaselineGeometryPair {
+  readonly images: readonly [string, string];
+  readonly roles: readonly string[];
+  readonly matches: readonly FrozenMatch[];
+}
+
 interface WorkingModel {
   readonly camera: ReturnType<typeof readWorkingCamera>;
   readonly images: readonly WorkingImage[];
   readonly points: readonly WorkingPoint[];
+}
+
+export interface PoseSafetyModel {
+  readonly images: readonly WorkingImage[];
 }
 
 interface PairEvaluation {
@@ -93,6 +81,46 @@ interface GeometrySample {
   readonly failure: string | null;
 }
 
+export function evaluateBaselineGeometry(
+  preflight: RefinerPreflight,
+  model: WorkingModel,
+  pairs: readonly BaselineGeometryPair[]
+) {
+  const evaluated = pairs.map((pair) => evaluatePair(model, pair));
+  const violations = evaluated.flatMap((entry) => {
+    const reasons: string[] = [];
+    if (entry.status === 'inconclusive') {
+      reasons.push(entry.reason ?? 'score unavailable');
+    }
+    if (
+      entry.geometry.failures > 0 ||
+      entry.geometry.usableCount < policy.minVerifiedMatches ||
+      entry.geometry.positiveDepthRatio < policy.minPositiveDepthRatio ||
+      !entry.support.usable
+    ) {
+      reasons.push('insufficient fixed-population geometry support');
+    }
+    return reasons.map(
+      (reason) => `${entry.images.join(' / ')}: ${reason}.`
+    );
+  });
+  const poseSafety = evaluatePoseSafety(preflight, model, model);
+  violations.push(...poseSafety.violations);
+  return {
+    violations,
+    pairs: evaluated.map((entry) => ({
+      images: entry.images,
+      status: entry.status,
+      reason: entry.reason,
+      count: entry.count,
+      metrics: entry.metrics,
+      geometry: entry.geometry,
+      support: entry.support,
+    })),
+    poseSafety,
+  };
+}
+
 export function decidePostBaVerdict(
   rejections: readonly string[],
   inconclusiveReasons: readonly string[]
@@ -112,12 +140,13 @@ export async function evaluatePostBaSafety(
     report = await evaluate(preflight, run);
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
+    const rejected = error instanceof CandidateViolationError;
     report = {
       schemaVersion: 1,
       policy,
-      verdict: 'Inconclusive',
-      rejections: [],
-      inconclusiveReasons: [reason],
+      verdict: rejected ? 'Rejected' : 'Inconclusive',
+      rejections: rejected ? [reason] : [],
+      inconclusiveReasons: rejected ? [] : [reason],
     };
   }
   await writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`, {
@@ -145,21 +174,11 @@ async function evaluate(
     readFile(join(evidenceDirectory, 'ba-result.json')),
   ]);
   const preBa = parseRecord(preBaBytes, 'pre-BA support');
-  const ba = parseRecord(baBytes, 'BA result');
+  const ba = await verifyBundleAdjustmentEvidence(preflight, run, false);
   if (preBa.status !== 'pass' || preBa.baParticipationEvaluated !== false) {
     throw new Error('Frozen pre-BA support is not a passing preparation gate.');
   }
-  if (
-    !isRecord(preBa.policy) ||
-    preBa.policy.minVerifiedMatches !== policy.minVerifiedMatches ||
-    preBa.policy.minUsableTracks !== policy.minUsableTracks ||
-    preBa.policy.minUsableObservations !== policy.minUsableObservations ||
-    preBa.policy.minParallaxDegrees !== policy.minParallaxDegrees ||
-    preBa.policy.depthEpsilon !== policy.depthEpsilon ||
-    preBa.policy.coverageGridRows !== policy.coverageGridRows ||
-    preBa.policy.coverageGridColumns !== policy.coverageGridColumns ||
-    preBa.policy.minCoverageEachImage !== policy.minCoverageEachImage
-  ) {
+  if (JSON.stringify(preBa.policy) !== JSON.stringify(policy)) {
     throw new Error('Frozen pre-BA policy differs from post-BA policy.');
   }
   if (
@@ -170,6 +189,17 @@ async function evaluate(
     ba.hardLocks.passed !== true
   ) {
     throw new Error('BA result is not a usable hard-lock-passing solve.');
+  }
+  const frozenBindings = await verifyFrozenBindings(
+    preflight,
+    run,
+    preBa,
+    correspondenceBytes
+  );
+  if (
+    JSON.stringify(ba.optimizationInputs) !== JSON.stringify(frozenBindings)
+  ) {
+    throw new Error('BA result is bound to different optimization inputs.');
   }
   const pairs = parseFrozenPairs(
     correspondenceBytes,
@@ -186,6 +216,7 @@ async function evaluate(
   const after = pairs.map((pair) => evaluatePair(candidate, pair));
   const rejections: string[] = [];
   const inconclusiveReasons: string[] = [];
+  const performanceRejections: string[] = [];
 
   const baselineMedians = before.flatMap((entry) =>
     entry.status === 'scored' ? [entry.metrics!.medianPx] : []
@@ -200,7 +231,7 @@ async function evaluate(
         policy.improvementTolerancePx
       : null;
   if (aggregateImproved === false) {
-    rejections.push('Aggregate epipolar error did not improve.');
+    performanceRejections.push('Aggregate epipolar error did not improve.');
   } else if (aggregateImproved === null) {
     inconclusiveReasons.push('Aggregate epipolar improvement is unavailable.');
   }
@@ -238,7 +269,7 @@ async function evaluate(
       }
     }
     if (vetoes.length > 0) {
-      rejections.push(
+      performanceRejections.push(
         `${baselinePair.images.join(' / ')}: ${vetoes.join(', ')}.`
       );
     }
@@ -304,6 +335,10 @@ async function evaluate(
     };
   });
 
+  const residualIdentities = residualObservationIdentities(ba, baseline);
+  if (residualIdentities === null) {
+    inconclusiveReasons.push('BA residual-selection evidence is malformed.');
+  }
   const protectedTrackPairs = before.map((baselinePair, index) => {
     const candidateTracks = new Set(after[index]!.support.trackIds);
     const losses = baselinePair.support.trackIds.filter(
@@ -314,10 +349,22 @@ async function evaluate(
         `${baselinePair.images.join(' / ')}: protected BA tracks lost eligibility: ${losses.join(', ')}.`
       );
     }
+    const participationLosses = baselinePair.support.trackIds.flatMap(
+      (trackId) =>
+        residualTrackParticipation(baseline, residualIdentities, trackId)
+          ? []
+          : [trackId]
+    );
+    if (participationLosses.length > 0) {
+      inconclusiveReasons.push(
+        `${baselinePair.images.join(' / ')}: BA participation is unverified for tracks ${participationLosses.join(', ')}.`
+      );
+    }
     return {
       images: baselinePair.images,
       protectedTrackIds: baselinePair.support.trackIds,
       losses,
+      participationLosses,
     };
   });
 
@@ -340,14 +387,34 @@ async function evaluate(
     (count, point) => count + point.track.length,
     0
   );
+  const expectedResidualIdentities = new Set(
+    baseline.points.flatMap((point) =>
+      point.track.map(
+        (entry) =>
+          `${entry.imageId}:${entry.point2DIndex}:${point.point3DId}`
+      )
+    )
+  );
   if (ba.scalarReprojectionResidualCount !== linkedObservationCount * 2) {
     inconclusiveReasons.push(
       'BA residual evidence does not cover every linked observation.'
     );
   }
+  if (
+    residualIdentities !== null &&
+    (residualIdentities.size !== linkedObservationCount ||
+      !sameSet(residualIdentities, expectedResidualIdentities))
+  ) {
+    inconclusiveReasons.push(
+      'BA residual identity inventory does not exactly match linked observations.'
+    );
+  }
 
   const poseSafety = evaluatePoseSafety(preflight, baseline, candidate);
   rejections.push(...poseSafety.violations);
+  if (inconclusiveReasons.length === 0) {
+    rejections.push(...performanceRejections);
+  }
   const verdict = decidePostBaVerdict(rejections, inconclusiveReasons);
   return {
     schemaVersion: 1,
@@ -357,6 +424,7 @@ async function evaluate(
       correspondencesSha256: sha256(correspondenceBytes),
       preBaSupportSha256: sha256(preBaBytes),
       baResultSha256: sha256(baBytes),
+      optimizationInputs: frozenBindings,
     },
     verdict,
     finalAcceptance: false,
@@ -375,6 +443,8 @@ async function evaluate(
           ? median(candidateMedians)
           : null,
       pairVetoes,
+      deferredRejections:
+        inconclusiveReasons.length > 0 ? performanceRejections : [],
     },
     baseline: before,
     candidate: after,
@@ -406,6 +476,133 @@ async function readModel(directory: string): Promise<WorkingModel> {
     images: readWorkingImages(images),
     points: readWorkingPoints(points),
   };
+}
+
+async function verifyFrozenBindings(
+  preflight: RefinerPreflight,
+  run: PreparedRun,
+  preBa: Record<string, unknown>,
+  correspondenceBytes: Uint8Array
+): Promise<Record<string, unknown>> {
+  const bindings = requireRecord(preBa.bindings, 'Pre-BA bindings');
+  const database = requireRecord(
+    bindings.matchingDatabase,
+    'Pre-BA matching database binding'
+  );
+  const model = requireRecord(
+    bindings.triangulatedModel,
+    'Pre-BA triangulated model binding'
+  );
+  const binaryModel = requireRecord(
+    bindings.triangulatedBinaryModel,
+    'Pre-BA triangulated binary model binding'
+  );
+  if (
+    bindings.inputSha256 !== preflight.inputSha256 ||
+    bindings.correspondencesSha256 !== sha256(correspondenceBytes) ||
+    typeof database.path !== 'string' ||
+    typeof database.sha256 !== 'string'
+  ) {
+    throw new Error('Pre-BA evidence bindings are stale or malformed.');
+  }
+  const databasePath = resolve(run.runDirectory, database.path);
+  const databaseRelative = relative(run.runDirectory, databasePath);
+  if (
+    databaseRelative.startsWith('..') ||
+    isAbsolute(databaseRelative) ||
+    database.sha256 !== sha256(await readFile(databasePath))
+  ) {
+    throw new Error('Frozen matching database changed before scoring.');
+  }
+  for (const filename of ['cameras.txt', 'images.txt', 'points3D.txt']) {
+    const path = join(run.runDirectory, 'exports', 'triangulated', filename);
+    if (model[filename] !== sha256(await readFile(path))) {
+      throw new Error(`Frozen triangulated ${filename} changed before scoring.`);
+    }
+  }
+  for (const filename of [
+    'cameras.bin',
+    'frames.bin',
+    'images.bin',
+    'points3D.bin',
+    'rigs.bin',
+  ]) {
+    const path = join(run.runDirectory, 'models', 'triangulated', filename);
+    if (binaryModel[filename] !== sha256(await readFile(path))) {
+      throw new Error(`Frozen triangulated ${filename} changed before scoring.`);
+    }
+  }
+  return bindings;
+}
+
+function residualObservationIdentities(
+  ba: Record<string, unknown>,
+  baseline: WorkingModel
+): ReadonlySet<string> | null {
+  if (!isRecord(ba.residualSelection)) return null;
+  const selection = ba.residualSelection;
+  const linkedObservationCount = baseline.points.reduce(
+    (count, point) => count + point.track.length,
+    0
+  );
+  const imageIds = baseline.images
+    .map((image) => image.imageId)
+    .sort((left, right) => left - right);
+  if (
+    selection.method !== 'pycolmap-config-num-residuals-v2' ||
+    selection.nativeApi !== 'BundleAdjustmentConfig.num_residuals' ||
+    JSON.stringify(selection.configuredImageIds) !== JSON.stringify(imageIds) ||
+    JSON.stringify(selection.reconstructionImageIds) !==
+      JSON.stringify(imageIds) ||
+    selection.linkedObservationCount !== linkedObservationCount ||
+    selection.expectedScalarResidualCount !== linkedObservationCount * 2 ||
+    selection.nativeScalarResidualCount !== linkedObservationCount * 2 ||
+    ba.scalarReprojectionResidualCount !== linkedObservationCount * 2 ||
+    !isRecord(selection.identityProof) ||
+    selection.identityProof.status !== 'verified' ||
+    selection.identityProof.method !==
+      'native-residual-identity-inventory-v1' ||
+    JSON.stringify(selection.identityProof.pycolmapBinaryHashes) !==
+      JSON.stringify(ba.pycolmapBinaryHashes) ||
+    !Array.isArray(selection.observationIdentities)
+  ) {
+    return null;
+  }
+  const identities = selection.observationIdentities.flatMap(
+    (entry) =>
+      isRecord(entry) &&
+      Number.isSafeInteger(entry.imageId) &&
+      Number.isSafeInteger(entry.point2DIndex) &&
+      Number.isSafeInteger(entry.point3DId)
+        ? [`${entry.imageId}:${entry.point2DIndex}:${entry.point3DId}`]
+        : []
+  );
+  if (
+    identities.length !== selection.observationIdentities.length ||
+    new Set(identities).size !== identities.length
+  ) {
+    return null;
+  }
+  return new Set(identities);
+}
+
+function residualTrackParticipation(
+  baseline: WorkingModel,
+  identities: ReadonlySet<string> | null,
+  trackId: number
+): boolean {
+  if (identities === null) return false;
+  const point = baseline.points.find((entry) => entry.point3DId === trackId);
+  return (
+    point !== undefined &&
+    point.track.every((entry) =>
+      identities.has(`${entry.imageId}:${entry.point2DIndex}:${trackId}`)
+    )
+  );
+}
+
+function sameSet(left: ReadonlySet<string>, right: ReadonlySet<string>): boolean {
+  return left.size === right.size && [...left].every((value) => right.has(value));
 }
 
 function evaluatePair(model: WorkingModel, pair: FrozenPair): PairEvaluation {
@@ -681,10 +878,10 @@ function protectedBaObservationLosses(
   return losses;
 }
 
-function evaluatePoseSafety(
+export function evaluatePoseSafety(
   preflight: RefinerPreflight,
-  baseline: WorkingModel,
-  candidate: WorkingModel
+  baseline: PoseSafetyModel,
+  candidate: PoseSafetyModel
 ) {
   const originals = new Map(
     preflight.dataset.model.images.map((image) => [image.name, image.pose])
@@ -888,7 +1085,9 @@ function requireSameModelIdentity(
   candidate: WorkingModel
 ): void {
   if (JSON.stringify(baseline.camera) !== JSON.stringify(candidate.camera)) {
-    throw new Error('Candidate camera calibration differs from the baseline.');
+    throw new CandidateViolationError(
+      'Candidate camera calibration differs from the baseline.'
+    );
   }
   const candidateImages = new Map(
     candidate.images.map((image) => [image.name, image])
@@ -900,7 +1099,7 @@ function requireSameModelIdentity(
     candidateImages.size !== baseline.images.length ||
     candidatePoints.size !== baseline.points.length
   ) {
-    throw new Error(
+    throw new CandidateViolationError(
       'Candidate image or point population differs from the baseline.'
     );
   }
@@ -913,7 +1112,9 @@ function requireSameModelIdentity(
       JSON.stringify(current.observations.map((entry) => entry.point3DId)) !==
         JSON.stringify(image.observations.map((entry) => entry.point3DId))
     ) {
-      throw new Error(`Candidate image identity changed for ${image.name}.`);
+      throw new CandidateViolationError(
+        `Candidate image identity changed for ${image.name}.`
+      );
     }
   }
   for (const point of baseline.points) {
@@ -921,7 +1122,7 @@ function requireSameModelIdentity(
       JSON.stringify(candidatePoints.get(point.point3DId)?.track) !==
       JSON.stringify(point.track)
     ) {
-      throw new Error(
+      throw new CandidateViolationError(
         `Candidate track identity changed for ${point.point3DId}.`
       );
     }
@@ -1190,6 +1391,11 @@ function parseRecord(
   field: string
 ): Record<string, unknown> {
   const value: unknown = JSON.parse(Buffer.from(bytes).toString('utf8'));
+  if (!isRecord(value)) throw new Error(`${field} must be a JSON object.`);
+  return value;
+}
+
+function requireRecord(value: unknown, field: string): Record<string, unknown> {
   if (!isRecord(value)) throw new Error(`${field} must be a JSON object.`);
   return value;
 }

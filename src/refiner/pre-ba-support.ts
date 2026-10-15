@@ -1,26 +1,27 @@
+import { createHash } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
 import type { RefinerPreflight } from './preflight.js';
 import type { PreparedRun } from './run-directory.js';
+import { acceptancePolicy as policy } from './acceptance-policy.js';
+import { evaluateBaselineGeometry } from './post-ba-safety.js';
 import {
+  readWorkingCamera,
   readWorkingImages,
   readWorkingPoints,
   type WorkingImage,
   type WorkingPoint,
 } from './triangulation.js';
 
-const policy = {
-  minVerifiedMatches: 15,
-  minUsableTracks: 10,
-  minUsableObservations: 20,
-  minParallaxDegrees: 1.5,
-  depthEpsilon: 1e-6,
-  coverageGridRows: 10,
-  coverageGridColumns: 10,
-  minCoverageEachImage: 0.05,
-} as const;
+const binaryModelFiles = [
+  'cameras.bin',
+  'frames.bin',
+  'images.bin',
+  'points3D.bin',
+  'rigs.bin',
+] as const;
 
 interface RequiredPair {
   readonly images: readonly [string, string];
@@ -38,21 +39,35 @@ interface DatabasePair {
 
 export async function verifyPreBaSupport(
   preflight: RefinerPreflight,
-  run: PreparedRun
+  run: PreparedRun,
+  databaseRelativePath: string
 ): Promise<void> {
+  const databasePath = join(run.runDirectory, databaseRelativePath);
   const pairs = requiredPairs(preflight);
-  const database = readDatabasePairs(
-    join(run.runDirectory, 'database', 'exhaustive.db'),
-    pairs
-  );
+  const database = readDatabasePairs(databasePath, pairs);
   const exportDirectory = join(run.runDirectory, 'exports', 'triangulated');
+  const cameraBytes = await readFile(join(exportDirectory, 'cameras.txt'));
+  const imageBytes = await readFile(join(exportDirectory, 'images.txt'));
+  const pointBytes = await readFile(join(exportDirectory, 'points3D.txt'));
+  const binaryModel = Object.fromEntries(
+    await Promise.all(
+      binaryModelFiles.map(async (filename) => [
+        filename,
+        sha256(
+          await readFile(
+            join(run.runDirectory, 'models', 'triangulated', filename)
+          )
+        ),
+      ])
+    )
+  );
+  const camera = readWorkingCamera(cameraBytes.toString('utf8'));
   const images = readWorkingImages(
-    await readFile(join(exportDirectory, 'images.txt'), 'utf8')
+    imageBytes.toString('utf8')
   );
-  const points = readWorkingPoints(
-    await readFile(join(exportDirectory, 'points3D.txt'), 'utf8')
-  );
+  const points = readWorkingPoints(pointBytes.toString('utf8'));
   verifyReciprocalTracks(images, points);
+  const baselineSafety = verifyBaselineSafety(preflight, camera, images);
 
   const imageById = new Map(images.map((image) => [image.imageId, image]));
   const evidence = pairs.map((pair, index) =>
@@ -63,6 +78,14 @@ export async function verifyPreBaSupport(
       points,
       preflight.dataset.model.cameras[0]!
     )
+  );
+  const baselineGeometry = evaluateBaselineGeometry(
+    preflight,
+    { camera, images, points },
+    pairs.map((pair, index) => ({
+      ...pair,
+      matches: database[index]!.verified,
+    }))
   );
   const edges = new Map(
     preflight.dataset.model.images.map((image) => [
@@ -78,18 +101,53 @@ export async function verifyPreBaSupport(
   const connectedComponents = components(edges);
   const status =
     evidence.every((pair) => pair.status === 'pass') &&
-    connectedComponents.length === 1
+    connectedComponents.length === 1 &&
+    baselineSafety.violations.length === 0 &&
+    baselineGeometry.violations.length === 0
       ? 'pass'
       : 'inconclusive';
+  const correspondenceText = `${JSON.stringify(
+    {
+      schemaVersion: 1,
+      pairs: pairs.map((pair, index) => ({
+        images: pair.images,
+        roles: pair.roles,
+        matches: database[index]!.verified,
+      })),
+    },
+    null,
+    2
+  )}\n`;
   const report = {
     schemaVersion: 1,
     status,
     policy,
+    bindings: {
+      inputSha256: preflight.inputSha256,
+      matchingDatabase: {
+        path: databaseRelativePath,
+        sha256: sha256(await readFile(databasePath)),
+      },
+      triangulatedModel: {
+        'cameras.txt': sha256(cameraBytes),
+        'images.txt': sha256(imageBytes),
+        'points3D.txt': sha256(pointBytes),
+      },
+      triangulatedBinaryModel: binaryModel,
+      correspondencesSha256: sha256(Buffer.from(correspondenceText)),
+    },
+    baselineSafety,
+    baselineGeometry,
     connectedComponents,
     pairs: evidence,
     baParticipationEvaluated: false,
   } as const;
   await Promise.all([
+    writeFile(
+      join(run.runDirectory, 'metrics', 'correspondences.json'),
+      correspondenceText,
+      { flag: 'wx' }
+    ),
     writeFile(
       join(run.runDirectory, 'metrics', 'pre-ba-support.json'),
       `${JSON.stringify(report, null, 2)}\n`,
@@ -98,22 +156,6 @@ export async function verifyPreBaSupport(
     writeFile(
       join(run.runDirectory, 'metrics', 'loop-support.md'),
       supportMarkdown(report),
-      { flag: 'wx' }
-    ),
-    writeFile(
-      join(run.runDirectory, 'metrics', 'correspondences.json'),
-      `${JSON.stringify(
-        {
-          schemaVersion: 1,
-          pairs: pairs.map((pair, index) => ({
-            images: pair.images,
-            roles: pair.roles,
-            matches: database[index]!.verified,
-          })),
-        },
-        null,
-        2
-      )}\n`,
       { flag: 'wx' }
     ),
   ]);
@@ -127,6 +169,80 @@ export async function verifyPreBaSupport(
   if (connectedComponents.length !== 1) {
     throw new Error('pre-BA support does not connect every recorder image.');
   }
+  if (baselineSafety.violations.length > 0) {
+    throw new Error(`pre-BA baseline is unsafe: ${baselineSafety.violations[0]}`);
+  }
+  if (baselineGeometry.violations.length > 0) {
+    throw new Error(
+      `pre-BA baseline geometry is insufficient: ${baselineGeometry.violations[0]}`
+    );
+  }
+}
+
+function verifyBaselineSafety(
+  preflight: RefinerPreflight,
+  camera: ReturnType<typeof readWorkingCamera>,
+  images: readonly WorkingImage[]
+) {
+  const originalCamera = preflight.dataset.model.cameras[0]!;
+  const violations: string[] = [];
+  if (
+    preflight.dataset.model.cameras.length !== 1 ||
+    camera.width !== originalCamera.width ||
+    camera.height !== originalCamera.height ||
+    JSON.stringify(camera.params) !==
+      JSON.stringify([
+        originalCamera.intrinsics.fx,
+        originalCamera.intrinsics.fy,
+        originalCamera.intrinsics.cx,
+        originalCamera.intrinsics.cy,
+      ])
+  ) {
+    violations.push('triangulated calibration differs from the recorder');
+  }
+  const byName = new Map(images.map((image) => [image.name, image]));
+  for (const original of preflight.dataset.model.images) {
+    const image = byName.get(original.name);
+    if (
+      image === undefined ||
+      image.cameraId !== camera.cameraId ||
+      !sameQuaternion(image.qvec, original.pose.qvec) ||
+      !sameNumbers(image.tvec, original.pose.tvec)
+    ) {
+      violations.push(`${original.name}: triangulated frame differs from recorder`);
+    }
+  }
+  const anchorDistances = anchorScaleDistances(
+    images,
+    preflight.config.anchors
+  );
+  if (!hasNonzeroAnchorScale(anchorDistances)) {
+    violations.push('anchors do not define a nonzero scale');
+  }
+  return { violations, anchorDistances };
+}
+
+export function hasNonzeroAnchorScale(distances: readonly number[]): boolean {
+  return distances.every(
+    (value) => Number.isFinite(value) && value > policy.depthEpsilon
+  );
+}
+
+export function anchorScaleDistances(
+  images: readonly WorkingImage[],
+  anchors: readonly [string, string, string]
+): readonly number[] {
+  const byName = new Map(images.map((image) => [image.name, image]));
+  const centres = anchors.map((name) => {
+    const image = byName.get(name);
+    if (image === undefined) throw new Error(`Missing anchor ${name}.`);
+    return cameraCenter(image);
+  });
+  return [
+    distance(centres[0]!, centres[1]!),
+    distance(centres[0]!, centres[2]!),
+    distance(centres[1]!, centres[2]!),
+  ];
 }
 
 function requiredPairs(preflight: RefinerPreflight): readonly RequiredPair[] {
@@ -482,6 +598,27 @@ function rotationMatrix(qvec: readonly number[]): readonly number[] {
   ];
 }
 
+function sameQuaternion(left: readonly number[], right: readonly number[]) {
+  const direct = Math.max(
+    ...left.map((value, index) => Math.abs(value - right[index]!))
+  );
+  const negated = Math.max(
+    ...left.map((value, index) => Math.abs(value + right[index]!))
+  );
+  return Math.min(direct, negated) <= 1e-7;
+}
+
+function sameNumbers(left: readonly number[], right: readonly number[]) {
+  return (
+    left.length === right.length &&
+    left.every((value, index) => Math.abs(value - right[index]!) <= 1e-7)
+  );
+}
+
+function distance(left: readonly number[], right: readonly number[]) {
+  return Math.hypot(...subtract(left, right));
+}
+
 function components(edges: ReadonlyMap<string, ReadonlySet<string>>) {
   const unseen = new Set(edges.keys());
   const result: string[][] = [];
@@ -535,4 +672,8 @@ function subtract(left: readonly number[], right: readonly number[]) {
 
 function dot(left: readonly number[], right: readonly number[]) {
   return left.reduce((sum, value, index) => sum + value * right[index]!, 0);
+}
+
+function sha256(bytes: Uint8Array) {
+  return createHash('sha256').update(bytes).digest('hex');
 }

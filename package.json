@@ -2,6 +2,7 @@
   "name": "recorder-colmap-refiner",
   "version": "0.1.0",
   "description": "Offline COLMAP pose-refinement pipeline for recorder ZIPs",
+  "license": "Apache-2.0",
   "private": true,
   "type": "module",
   "bin": {
@@ -14,9 +15,10 @@
   },
   "scripts": {
     "build": "node scripts/copy-runtime.mjs && tsc -p tsconfig.build.json",
-    "check": "pnpm run typecheck && pnpm run build && pnpm run test && pnpm run test:package",
+    "check": "pnpm run typecheck && pnpm run build && pnpm run test && pnpm run test:python && pnpm run test:package",
     "refine": "node dist/src/bin.js refine",
     "test": "vitest run",
+    "test:python": "uv run --frozen python -m unittest scripts/test_three_anchor_ba.py",
     "test:package": "node scripts/package-smoke.mjs",
     "typecheck": "tsc --noEmit"
   },

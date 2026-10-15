@@ -9,6 +9,7 @@ The tool runs this fixed workflow:
 ```text
 recorder ZIP
   -> SIFT feature extraction and exhaustive matching
+     (clean selected-pair fallback on failure)
   -> fixed-pose triangulation
   -> pre-BA support checks
   -> inspected three-anchor, translation-only bundle adjustment
@@ -23,9 +24,10 @@ candidate passes the tool's deterministic checks.
 ## Requirements
 
 - Node.js 24.14.0 and pnpm 11.11.0
-- A pinned COLMAP executable whose help output identifies the configured version
-  and build
-- A pinned Python executable with the configured PyCOLMAP version
+- The verified native baseline is COLMAP 4.2.0, commit `be5e291`, CUDA build.
+  Other builds require a separate controlled verification.
+- Python 3.12.14, NumPy 2.5.3, and PyCOLMAP 4.2.0, installed from
+  `pyproject.toml` and `uv.lock`
 - A recorder ZIP containing `sparse/0/cameras.txt`, `images.txt`,
   `points3D.txt`, and its referenced images
 - A GPU available to the configured COLMAP exhaustive matcher
@@ -37,11 +39,13 @@ need network access.
 
 ```powershell
 pnpm install --frozen-lockfile
+uv sync
 pnpm check
 ```
 
 `pnpm check` type-checks, builds, runs the unit tests, and smoke-tests the
-packaged command and Python-driver layout.
+packaged command and Python-driver layout. It also runs the Python driver tests
+through the frozen `uv` environment.
 
 ## Configure a run
 
@@ -94,7 +98,9 @@ run instead.
 
 A run records its resolved inputs, hashes, native-tool logs, frozen
 correspondences, model exports, and metric reports beneath its isolated run
-directory.
+directory. Failed or stopped runs retain `run-result.json` at the run root.
+Delivered runs publish `output/run-result.json` in the same atomic directory as
+`candidate.zip` and `transfer.json`.
 
 Post-BA geometry has three possible verdicts:
 
@@ -103,10 +109,16 @@ Post-BA geometry has three possible verdicts:
 - `Inconclusive`: required evidence was absent, stale, non-finite, or otherwise
   insufficient.
 
+PyCOLMAP 4.2 exposes the selected residual count but not the selected residual
+identities. Until native identity-selection evidence is available, a real run
+stops as `Inconclusive` after inspection and before starting BA.
+
 Only `Pass` produces `output/candidate.zip`. The transfer stage reopens that ZIP
 and verifies pose serialization, frame and scale safety, and preservation of the
 original points, intrinsics, identities, and archive assets. It never overwrites
-the input ZIP.
+the input ZIP. Publication first reserves a permanent attempt record and then
+atomically renames a staging directory containing the verified ZIP and its
+completion evidence into place.
 
 A passing ZIP is a provisionally accepted geometry candidate, not proof that a
 Gaussian splat will look better. If visual confirmation is required, train the
@@ -128,3 +140,20 @@ and retain both outputs as separate evidence.
 Future work should start with more varied recorder captures and independently
 reviewed evidence before widening the COLMAP subset, automating selection, or
 changing the optimization and acceptance policies.
+
+## Contributions and maintenance
+
+This repository is a SoftwareLab project snapshot, not a maintained production
+service. Issues and focused pull requests are welcome, but ongoing support and
+response times are not guaranteed. Changes to optimization or acceptance rules
+must include evidence and counterexample tests.
+
+## Acknowledgements
+
+Filip and Mingna developed and evaluated the Team 6 pipeline. Simon served as
+Product Owner and contributed the project requirements and research direction.
+
+## Licence
+
+The project is licensed under Apache-2.0. Runtime and package attribution is
+recorded in `NOTICE`.

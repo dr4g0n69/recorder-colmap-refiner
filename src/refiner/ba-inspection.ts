@@ -19,7 +19,7 @@ export async function inspectBundleAdjustment(
   preflight: RefinerPreflight,
   run: PreparedRun,
   executor: NativeCommandExecutor
-): Promise<void> {
+): Promise<string | null> {
   const preBaPath = join(run.runDirectory, 'metrics', 'pre-ba-support.json');
   const reportPath = join(run.runDirectory, 'evidence', 'ba-inspection.json');
   const preBaSha256 = sha256(await readFile(preBaPath));
@@ -62,6 +62,12 @@ export async function inspectBundleAdjustment(
   if (report.solveCalled !== false) {
     throw new Error('BA inspection must not call the solver.');
   }
+  const identityProof = identityProofStatus(
+    isRecord(report.residualSelection)
+      ? report.residualSelection.identityProof
+      : undefined,
+    report.pycolmapBinaryHashes
+  );
   if (
     report.schemaVersion !== 1 ||
     report.pycolmapVersion !== preflight.config.python.pycolmapVersion ||
@@ -83,6 +89,30 @@ export async function inspectBundleAdjustment(
       2 * report.linkedObservationCount
   ) {
     throw new Error('BA inspection does not match the constrained problem.');
+  }
+  if (
+    !isRecord(report.optimizationInputs) ||
+    !isRecord(report.residualSelection) ||
+    report.residualSelection.method !== 'pycolmap-config-num-residuals-v2' ||
+    report.residualSelection.nativeApi !==
+      'BundleAdjustmentConfig.num_residuals' ||
+    !samePositiveIntegerArray(
+      report.residualSelection.configuredImageIds,
+      report.residualSelection.reconstructionImageIds,
+      imageCount
+    ) ||
+    report.residualSelection.linkedObservationCount !==
+      report.linkedObservationCount ||
+    report.residualSelection.expectedScalarResidualCount !==
+      report.scalarReprojectionResidualCount ||
+    report.residualSelection.nativeScalarResidualCount !==
+      report.scalarReprojectionResidualCount ||
+    identityProof === null ||
+    !Array.isArray(report.residualSelection.observationIdentities) ||
+    report.residualSelection.observationIdentities.length !==
+      report.linkedObservationCount
+  ) {
+    throw new Error('BA inspection lacks frozen residual-selection evidence.');
   }
   if (
     !Array.isArray(report.anchors) ||
@@ -107,6 +137,42 @@ export async function inspectBundleAdjustment(
   ) {
     throw new Error('BA inspection lacks effective settings or runtime hashes.');
   }
+  return identityProof === 'unavailable'
+    ? 'Native residual-identity evidence is unavailable.'
+    : null;
+}
+
+function identityProofStatus(
+  proof: unknown,
+  binaryHashes: unknown
+): 'verified' | 'unavailable' | null {
+  if (!isRecord(proof)) return null;
+  if (proof.status === 'unavailable') {
+    return typeof proof.reason === 'string' && proof.reason.length > 0
+      ? 'unavailable'
+      : null;
+  }
+  return proof.status === 'verified' &&
+    proof.method === 'native-residual-identity-inventory-v1' &&
+    JSON.stringify(proof.pycolmapBinaryHashes) === JSON.stringify(binaryHashes)
+      ? 'verified'
+      : null;
+}
+
+function samePositiveIntegerArray(
+  left: unknown,
+  right: unknown,
+  expectedLength: number
+): boolean {
+  return (
+    Array.isArray(left) &&
+    Array.isArray(right) &&
+    left.length === expectedLength &&
+    new Set(left).size === expectedLength &&
+    left.every((value, index) =>
+      positiveInteger(value) && value === right[index]
+    )
+  );
 }
 
 function sha256(bytes: Uint8Array): string {

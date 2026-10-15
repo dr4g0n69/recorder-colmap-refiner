@@ -39,14 +39,15 @@ export interface WorkingPoint {
 export async function runFixedPoseTriangulation(
   preflight: RefinerPreflight,
   run: PreparedRun,
-  executor: NativeCommandExecutor
+  executor: NativeCommandExecutor,
+  databasePath: string
 ): Promise<void> {
   const logsDirectory = join(run.runDirectory, 'logs');
   await executeNativeCommand(
     triangulationCommand(
       preflight.config.colmap.executable,
       run.runDirectory,
-      'database/exhaustive.db'
+      databasePath
     ),
     executor,
     logsDirectory,

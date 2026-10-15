@@ -19,6 +19,7 @@ import {
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { readRecorderZip } from '../colmap/index.js';
+import { acceptancePolicy } from './acceptance-policy.js';
 import { transferAcceptedCandidate } from './pose-transfer.js';
 import type { RefinerPreflight } from './preflight.js';
 
@@ -64,9 +65,9 @@ describe('transferAcceptedCandidate', () => {
     const output = await readFile(result.outputPath);
     const reopened = await readRecorderZip(output);
     expect(reopened.model.images.map((image) => image.pose.tvec)).toEqual([
-      [1, 0, 0],
-      [0, 0.05, 0],
-      [-1, 0, 0],
+      [0.5, 0, 0],
+      [0, 0, 0],
+      [-0.5, 0, 0],
     ]);
     expect(
       reopened.model.images.every((image) => image.observations.length === 0)
@@ -89,7 +90,7 @@ describe('transferAcceptedCandidate', () => {
     expect(
       JSON.parse(
         await readFile(
-          join(fixture.run.runDirectory, 'metrics', 'transfer.json'),
+          join(fixture.run.runDirectory, 'output', 'transfer.json'),
           'utf8'
         )
       )
@@ -106,6 +107,23 @@ describe('transferAcceptedCandidate', () => {
         }),
       })
     );
+    expect(
+      JSON.parse(
+        await readFile(
+          join(fixture.run.runDirectory, 'output', 'run-result.json'),
+          'utf8'
+        )
+      )
+    ).toEqual(
+      expect.objectContaining({
+        stage: 'zip-transfer',
+        outcome: 'Delivered',
+        candidateSha256: sha256(output),
+      })
+    );
+    await expect(
+      stat(join(fixture.run.runDirectory, 'run-result.json'))
+    ).rejects.toThrow();
   });
 
   it('rejects a missing candidate image before publication', async () => {
@@ -132,30 +150,81 @@ describe('transferAcceptedCandidate', () => {
     ).rejects.toThrow('Transfer output already exists.');
     expect(await readFile(first.outputPath)).toEqual(bytes);
   });
+
+  it('does not retry an interrupted publication attempt', async () => {
+    const fixture = await transferFixture();
+    await writeFile(
+      join(
+        fixture.run.runDirectory,
+        'evidence',
+        'zip-publication-attempt.json'
+      ),
+      '{}'
+    );
+
+    await expect(
+      transferAcceptedCandidate(fixture.preflight, fixture.run)
+    ).rejects.toThrow('Transfer output already exists.');
+    await expect(
+      stat(join(fixture.run.runDirectory, 'output', 'candidate.zip'))
+    ).rejects.toThrow();
+  });
+
+  it('rejects a moved anchor even when the supplied geometry receipt says Pass', async () => {
+    const fixture = await transferFixture({ movedAnchor: true });
+
+    await expect(
+      transferAcceptedCandidate(fixture.preflight, fixture.run)
+    ).rejects.toThrow('Reopened ZIP failed pose/frame safety');
+    await expect(
+      stat(join(fixture.run.runDirectory, 'output', 'candidate.zip'))
+    ).rejects.toThrow();
+  });
+
+  it('rejects a pre-BA policy that differs from the frozen acceptance policy', async () => {
+    const fixture = await transferFixture({ changedPolicy: true });
+
+    await expect(
+      transferAcceptedCandidate(fixture.preflight, fixture.run)
+    ).rejects.toThrow('Frozen pre-BA policy changed before transfer.');
+    await expect(
+      stat(join(fixture.run.runDirectory, 'output', 'candidate.zip'))
+    ).rejects.toThrow();
+  });
 });
 
 async function transferFixture(
-  options: { readonly missingImage?: boolean } = {}
+  options: {
+    readonly missingImage?: boolean;
+    readonly movedAnchor?: boolean;
+    readonly changedPolicy?: boolean;
+  } = {}
 ) {
   const runDirectory = await mkdtemp(join(tmpdir(), 'pose-transfer-'));
   temporaryDirectories.push(runDirectory);
   await Promise.all(
-    ['input', 'metrics', 'evidence', 'exports/adjusted', 'output'].map((path) =>
-      mkdir(join(runDirectory, path), { recursive: true })
-    )
+    [
+      'input',
+      'metrics',
+      'evidence',
+      'database',
+      'models/triangulated',
+      'exports/triangulated',
+      'exports/adjusted',
+    ].map((path) => mkdir(join(runDirectory, path), { recursive: true }))
   );
   const inputBytes = await recorderZip();
   await writeFile(join(runDirectory, 'input', 'original.zip'), inputBytes);
   const dataset = await readRecorderZip(inputBytes);
   const cameras = '41 PINHOLE 640 480 500 500 320 240\n';
   const images = [
-    '20 1 0 0 0 1 0 0 41 frame-000001.jpg',
+    '20 1 0 0 0 0.5 0 0 41 frame-000001.jpg',
     '100 100 1 200 200 1',
-    '5 1 0 0 0 0 0.05 0 41 frame-000002.jpg',
+    `5 1 0 0 0 0 ${options.movedAnchor ? 0.05 : 0} 0 41 frame-000002.jpg`,
     '101 101 1 201 201 1',
     ...(options.missingImage
       ? []
-      : ['80 1 0 0 0 -1 0 0 41 frame-000003.jpg', '102 102 1 202 202 1']),
+      : ['80 1 0 0 0 -0.5 0 0 41 frame-000003.jpg', '102 102 1 202 202 1']),
     '',
   ].join('\n');
   const points = '1 9 9 9 255 0 0 0.1 20 0 5 0 80 0\n';
@@ -164,7 +233,61 @@ async function transferFixture(
     writeFile(join(exportDirectory, 'cameras.txt'), cameras),
     writeFile(join(exportDirectory, 'images.txt'), images),
     writeFile(join(exportDirectory, 'points3D.txt'), points),
+    writeFile(join(runDirectory, 'exports', 'triangulated', 'cameras.txt'), cameras),
+    writeFile(join(runDirectory, 'exports', 'triangulated', 'images.txt'), images),
+    writeFile(join(runDirectory, 'exports', 'triangulated', 'points3D.txt'), points),
   ]);
+  const databaseBytes = new Uint8Array([1, 2, 3]);
+  const binaryFiles = [
+    'cameras.bin',
+    'frames.bin',
+    'images.bin',
+    'points3D.bin',
+    'rigs.bin',
+  ] as const;
+  const binaryBytes = Object.fromEntries(
+    binaryFiles.map((filename) => [filename, new TextEncoder().encode(filename)])
+  );
+  const correspondenceText = '{}';
+  await Promise.all([
+    writeFile(join(runDirectory, 'database', 'selected.db'), databaseBytes),
+    ...binaryFiles.map((filename) =>
+      writeFile(
+        join(runDirectory, 'models', 'triangulated', filename),
+        binaryBytes[filename]!
+      )
+    ),
+    writeFile(
+      join(runDirectory, 'metrics', 'correspondences.json'),
+      correspondenceText
+    ),
+  ]);
+  const frozenBindings = {
+    inputSha256: sha256(inputBytes),
+    matchingDatabase: {
+      path: 'database/selected.db',
+      sha256: sha256(databaseBytes),
+    },
+    triangulatedModel: {
+      'cameras.txt': sha256(cameras),
+      'images.txt': sha256(images),
+      'points3D.txt': sha256(points),
+    },
+    triangulatedBinaryModel: Object.fromEntries(
+      binaryFiles.map((filename) => [filename, sha256(binaryBytes[filename]!)])
+    ),
+    correspondencesSha256: sha256(correspondenceText),
+  };
+  const preBaText = JSON.stringify({
+    bindings: frozenBindings,
+    policy: options.changedPolicy
+      ? { ...acceptancePolicy, improvementTolerancePx: -1 }
+      : acceptancePolicy,
+  });
+  await writeFile(
+    join(runDirectory, 'metrics', 'pre-ba-support.json'),
+    preBaText
+  );
   const exportHashes = {
     'cameras.txt': sha256(cameras),
     'images.txt': sha256(images),
@@ -183,13 +306,13 @@ async function transferFixture(
       verdict: 'Pass',
       finalAcceptance: false,
       nextRequiredGate: 'ZIP transfer and reopen verification',
-      policy: {
-        version: 'team6-post-ba-v1',
-        protectedGeometryVersion: 'protected-geometry-v1',
-      },
+      policy: acceptancePolicy,
       bindings: {
         inputSha256: sha256(inputBytes),
         baResultSha256: sha256(baResult),
+        preBaSupportSha256: sha256(preBaText),
+        correspondencesSha256: sha256(correspondenceText),
+        optimizationInputs: frozenBindings,
       },
     })
   );
@@ -242,11 +365,11 @@ async function recorderZip(): Promise<Uint8Array> {
     'sparse/0/images.txt',
     encoder.encode(
       [
-        '1 1 0 0 0 1 0 0 1 frame-000001.jpg',
+        '1 1 0 0 0 0.5 0 0 1 frame-000001.jpg',
         '',
         '2 1 0 0 0 0 0 0 1 frame-000002.jpg',
         '',
-        '3 1 0 0 0 -1 0 0 1 frame-000003.jpg',
+        '3 1 0 0 0 -0.5 0 0 1 frame-000003.jpg',
         '',
       ].join('\n')
     )

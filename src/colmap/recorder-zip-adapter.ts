@@ -54,7 +54,9 @@ const forbiddenBinaryPaths = [
 
 export const recorderZipAdapter: RecorderZipAdapter = {
   async open(zipBytes) {
-    const reader = new ZipReader(new Uint8ArrayReader(zipBytes));
+    const reader = new ZipReader(new Uint8ArrayReader(zipBytes), {
+      checkSignature: true,
+    });
     let opened: OpenedRecorderArchive | undefined;
     let failure: unknown;
 

@@ -1,0 +1,8 @@
+Recorder COLMAP Refiner
+Copyright 2026 Team 6 contributors
+
+This product includes zip.js, Copyright 2023 Gildas Lormeau,
+licensed under the BSD 3-Clause License.
+
+COLMAP and its PyCOLMAP bindings are external runtime prerequisites and are
+licensed separately by their authors under the BSD 3-Clause License.

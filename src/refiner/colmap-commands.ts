@@ -64,6 +64,31 @@ export function exhaustiveMatchingCommand(
   };
 }
 
+export function selectedMatchingCommand(
+  executable: string,
+  runDirectory: string
+): NativeCommand {
+  return {
+    stage: 'selected-matcher',
+    executable,
+    args: [
+      'matches_importer',
+      '--database_path',
+      'database/selected.db',
+      '--match_list_path',
+      'evidence/selected-pairs.txt',
+      '--match_type',
+      'pairs',
+      '--FeatureMatching.use_gpu',
+      '1',
+      '--FeatureMatching.gpu_index',
+      '0',
+    ],
+    cwd: runDirectory,
+    timeoutMs: 30 * 60 * 1000,
+  };
+}
+
 export function triangulationCommand(
   executable: string,
   runDirectory: string,

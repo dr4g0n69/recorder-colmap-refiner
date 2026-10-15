@@ -9,6 +9,7 @@ import {
   exhaustiveMatchingCommand,
   featureExtractionCommand,
   modelConversionCommand,
+  selectedMatchingCommand,
   triangulationCommand,
 } from './colmap-commands.js';
 import {
@@ -69,6 +70,25 @@ describe('COLMAP command builders', () => {
         'exhaustive_matcher',
         '--database_path',
         'database/exhaustive.db',
+        '--FeatureMatching.use_gpu',
+        '1',
+        '--FeatureMatching.gpu_index',
+        '0',
+      ],
+      cwd: runDirectory,
+      timeoutMs: 30 * 60 * 1000,
+    });
+    expect(selectedMatchingCommand(executable, runDirectory)).toEqual({
+      stage: 'selected-matcher',
+      executable,
+      args: [
+        'matches_importer',
+        '--database_path',
+        'database/selected.db',
+        '--match_list_path',
+        'evidence/selected-pairs.txt',
+        '--match_type',
+        'pairs',
         '--FeatureMatching.use_gpu',
         '1',
         '--FeatureMatching.gpu_index',

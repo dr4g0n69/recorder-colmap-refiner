@@ -1,9 +1,13 @@
 import { createHash } from 'node:crypto';
-import { readFile, writeFile } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { copyFile, readFile, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
-import { exhaustiveMatchingCommand } from './colmap-commands.js';
+import {
+  exhaustiveMatchingCommand,
+  selectedMatchingCommand,
+} from './colmap-commands.js';
 import {
   executeNativeCommand,
   type NativeCommandExecutor,
@@ -20,46 +24,99 @@ export async function runExhaustiveMatching(
   preflight: RefinerPreflight,
   run: PreparedRun,
   executor: NativeCommandExecutor
-): Promise<void> {
+): Promise<string> {
   const databasePath = join(run.runDirectory, 'database', 'exhaustive.db');
+  try {
+    await runAttempt(
+      databasePath,
+      'database/exhaustive.db',
+      'exhaustive-matching.json',
+      exhaustiveMatchingCommand(
+        preflight.config.colmap.executable,
+        run.runDirectory
+      ),
+      run,
+      executor,
+      2
+    );
+    return 'database/exhaustive.db';
+  } catch (error) {
+    const featuresPath = join(run.runDirectory, 'database', 'features.db');
+    const selectedPath = join(run.runDirectory, 'database', 'selected.db');
+    await copyFile(featuresPath, selectedPath, constants.COPYFILE_EXCL);
+    if ((await fileSha256(featuresPath)) !== (await fileSha256(selectedPath))) {
+      throw new Error('selected.db does not match the frozen feature database.');
+    }
+    const pairs = new Map<string, readonly [string, string]>();
+    for (const pair of [
+      ...preflight.sequentialPairs,
+      ...preflight.config.loopPairs,
+    ]) {
+      pairs.set([...pair].sort().join('\0'), pair);
+    }
+    await writeFile(
+      join(run.runDirectory, 'evidence', 'selected-pairs.txt'),
+      `${[...pairs.values()].map((pair) => pair.join(' ')).join('\n')}\n`,
+      { flag: 'wx' }
+    );
+    await runAttempt(
+      selectedPath,
+      'database/selected.db',
+      'selected-matching.json',
+      selectedMatchingCommand(
+        preflight.config.colmap.executable,
+        run.runDirectory
+      ),
+      run,
+      executor,
+      3,
+      error instanceof Error ? error.message : String(error)
+    );
+    return 'database/selected.db';
+  }
+}
+
+async function runAttempt(
+  databasePath: string,
+  relativePath: string,
+  evidenceName: string,
+  command: ReturnType<typeof exhaustiveMatchingCommand>,
+  run: PreparedRun,
+  executor: NativeCommandExecutor,
+  logIndex: number,
+  exhaustiveFailure?: string
+): Promise<void> {
   const before = readMatchCounts(databasePath);
   const beforeSha256 = await fileSha256(databasePath);
-
   await executeNativeCommand(
-    exhaustiveMatchingCommand(
-      preflight.config.colmap.executable,
-      run.runDirectory
-    ),
+    command,
     executor,
     join(run.runDirectory, 'logs'),
-    2
+    logIndex
   );
-
   const after = readMatchCounts(databasePath);
   if (
     after.verifiedMatches.correspondences <=
     before.verifiedMatches.correspondences
   ) {
-    throw new Error('exhaustive matcher added no verified correspondences.');
+    throw new Error('matcher added no verified correspondences.');
   }
   if (after.rawMatches.correspondences <= before.rawMatches.correspondences) {
-    throw new Error('exhaustive matcher added no raw correspondences.');
+    throw new Error('matcher added no raw correspondences.');
   }
-
   await writeFile(
-    join(run.runDirectory, 'evidence', 'exhaustive-matching.json'),
+    join(run.runDirectory, 'evidence', evidenceName),
     `${JSON.stringify(
       {
         schemaVersion: 1,
+        strategy: exhaustiveFailure ? 'selected-pairs-fallback' : 'exhaustive',
+        exhaustiveFailure: exhaustiveFailure ?? null,
         database: {
-          path: 'database/exhaustive.db',
+          path: relativePath,
           beforeSha256,
           afterSha256: await fileSha256(databasePath),
         },
-        rawMatches: {
-          before: before.rawMatches,
-          after: after.rawMatches,
-        },
+        rawMatches: { before: before.rawMatches, after: after.rawMatches },
         verifiedMatches: {
           before: before.verifiedMatches,
           after: after.verifiedMatches,

@@ -1,14 +1,14 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { constants } from 'node:fs';
 import {
   access,
-  copyFile,
+  mkdir,
   open,
   readFile,
-  unlink,
+  rename,
+  rm,
   writeFile,
 } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { isAbsolute, join, relative, resolve } from 'node:path';
 
 import {
   exactlyPreserved,
@@ -18,8 +18,10 @@ import {
   type RecorderColmapModel,
 } from '../colmap/index.js';
 import { recorderZipAdapter } from '../colmap/recorder-zip-adapter.js';
+import { acceptancePolicy } from './acceptance-policy.js';
 import type { RefinerPreflight } from './preflight.js';
 import type { PreparedRun } from './run-directory.js';
+import { evaluatePoseSafety, type PoseSafetyModel } from './post-ba-safety.js';
 import { readWorkingCamera, readWorkingImages } from './triangulation.js';
 
 const modelPaths = new Set([
@@ -33,9 +35,18 @@ export async function transferAcceptedCandidate(
   run: PreparedRun
 ): Promise<{ readonly outputPath: string; readonly reportPath: string }> {
   const metricsDirectory = join(run.runDirectory, 'metrics');
-  const outputPath = join(run.runDirectory, 'output', 'candidate.zip');
-  const reportPath = join(metricsDirectory, 'transfer.json');
-  if ((await exists(outputPath)) || (await exists(reportPath))) {
+  const outputDirectory = join(run.runDirectory, 'output');
+  const outputPath = join(outputDirectory, 'candidate.zip');
+  const reportPath = join(outputDirectory, 'transfer.json');
+  const publicationPath = join(
+    run.runDirectory,
+    'evidence',
+    'zip-publication-attempt.json'
+  );
+  if (
+    (await exists(outputDirectory)) ||
+    (await exists(publicationPath))
+  ) {
     throw new Error('Transfer output already exists.');
   }
   const safetyBytes = await readFile(
@@ -50,17 +61,14 @@ export async function transferAcceptedCandidate(
   ) {
     throw new Error('Transfer requires a passing post-BA geometry verdict.');
   }
-  const safetyPolicy = requireRecord(report.policy, 'Post-BA safety policy');
-  if (
-    safetyPolicy.version !== 'team6-post-ba-v1' ||
-    safetyPolicy.protectedGeometryVersion !== 'protected-geometry-v1'
-  ) {
-    throw new Error('Post-BA safety policy version is not accepted.');
+  if (JSON.stringify(report.policy) !== JSON.stringify(acceptancePolicy)) {
+    throw new Error('Post-BA safety policy is not the frozen policy.');
   }
   const bindings = requireRecord(report.bindings, 'Post-BA safety bindings');
   if (bindings.inputSha256 !== preflight.inputSha256) {
     throw new Error('Post-BA safety report is bound to a different input ZIP.');
   }
+  await verifyTransferBindings(run, bindings);
   const isolatedInputPath = join(run.runDirectory, 'input', 'original.zip');
   const isolatedInput = await readFile(isolatedInputPath);
   if (
@@ -114,6 +122,16 @@ export async function transferAcceptedCandidate(
     'Reopened ZIP differs from the approved candidate'
   );
   requirePoseOnlyMutation(preflight.dataset.model, reopened.model);
+  const reopenedPoseSafety = evaluatePoseSafety(
+    preflight,
+    recorderPoseModel(preflight.dataset.model),
+    recorderPoseModel(reopened.model)
+  );
+  if (reopenedPoseSafety.violations.length > 0) {
+    throw new Error(
+      `Reopened ZIP failed pose/frame safety: ${reopenedPoseSafety.violations[0]}`
+    );
+  }
   const nonModelEntries = await verifyArchivePreservation(
     preflight.inputZipBytes,
     output
@@ -130,6 +148,7 @@ export async function transferAcceptedCandidate(
     verification: {
       poseOnlyMutation: true,
       reopenedSemanticCandidate: true,
+      reopenedPoseFrameScaleSafety: true,
       untouchedArchiveEntries: true,
       nonModelEntries,
       mapping: candidate.images.map((image, index) => ({
@@ -143,12 +162,27 @@ export async function transferAcceptedCandidate(
       })),
     },
   } as const;
+  const transferText = `${JSON.stringify(transferReport, null, 2)}\n`;
+  const completionText = `${JSON.stringify(
+    {
+      schemaVersion: 1,
+      completedAt: new Date().toISOString(),
+      stage: 'zip-transfer',
+      outcome: 'Delivered',
+      reason: 'Candidate ZIP published and verified.',
+      candidateSha256,
+      transferReportSha256: sha256(Buffer.from(transferText)),
+    },
+    null,
+    2
+  )}\n`;
 
-  const temporaryPath = join(
+  const temporaryDirectory = join(
     run.runDirectory,
-    'output',
-    `.candidate-${randomUUID()}.tmp`
+    `.output-pending-${randomUUID()}`
   );
+  await mkdir(temporaryDirectory);
+  const temporaryPath = join(temporaryDirectory, 'candidate.zip');
   const temporary = await open(temporaryPath, 'wx');
   let published = false;
   try {
@@ -163,23 +197,142 @@ export async function transferAcceptedCandidate(
     if (sha256(await readFile(isolatedInputPath)) !== preflight.inputSha256) {
       throw new Error('Original ZIP changed during transfer.');
     }
-    await copyFile(temporaryPath, outputPath, constants.COPYFILE_EXCL);
+    await Promise.all([
+      writeFile(join(temporaryDirectory, 'transfer.json'), transferText, {
+        flag: 'wx',
+      }),
+      writeFile(join(temporaryDirectory, 'run-result.json'), completionText, {
+        flag: 'wx',
+      }),
+    ]);
+    await writeFile(
+      publicationPath,
+      `${JSON.stringify(
+        {
+          schemaVersion: 1,
+          permanent: true,
+          candidateSha256,
+          postBaSafetySha256: transferReport.postBaSafetySha256,
+          transferReportSha256: sha256(Buffer.from(transferText)),
+          completionSha256: sha256(Buffer.from(completionText)),
+        },
+        null,
+        2
+      )}\n`,
+      { flag: 'wx' }
+    );
+    await rename(temporaryDirectory, outputDirectory);
     published = true;
     if (sha256(await readFile(outputPath)) !== candidateSha256) {
       throw new Error('Published candidate ZIP hash mismatch.');
     }
-    await writeFile(
-      reportPath,
-      `${JSON.stringify(transferReport, null, 2)}\n`,
-      { flag: 'wx' }
-    );
   } catch (error) {
-    if (published) await unlink(outputPath).catch(() => undefined);
+    if (published) {
+      await rm(outputDirectory, { force: true, recursive: true }).catch(
+        () => undefined
+      );
+    }
     throw error;
   } finally {
-    await unlink(temporaryPath).catch(() => undefined);
+    await rm(temporaryDirectory, { force: true, recursive: true }).catch(
+      () => undefined
+    );
   }
   return { outputPath, reportPath };
+}
+
+async function verifyTransferBindings(
+  run: PreparedRun,
+  safetyBindings: Record<string, unknown>
+): Promise<void> {
+  const preBaPath = join(run.runDirectory, 'metrics', 'pre-ba-support.json');
+  const correspondencesPath = join(
+    run.runDirectory,
+    'metrics',
+    'correspondences.json'
+  );
+  const [preBaBytes, correspondenceBytes] = await Promise.all([
+    readFile(preBaPath),
+    readFile(correspondencesPath),
+  ]);
+  if (
+    safetyBindings.preBaSupportSha256 !== sha256(preBaBytes) ||
+    safetyBindings.correspondencesSha256 !== sha256(correspondenceBytes)
+  ) {
+    throw new Error('Post-BA safety bindings changed before transfer.');
+  }
+  const preBa = requireRecord(
+    JSON.parse(preBaBytes.toString('utf8')),
+    'Pre-BA support'
+  );
+  if (JSON.stringify(preBa.policy) !== JSON.stringify(acceptancePolicy)) {
+    throw new Error('Frozen pre-BA policy changed before transfer.');
+  }
+  const frozen = requireRecord(preBa.bindings, 'Pre-BA bindings');
+  if (JSON.stringify(safetyBindings.optimizationInputs) !== JSON.stringify(frozen)) {
+    throw new Error('Post-BA optimization-input bindings are stale.');
+  }
+  const database = requireRecord(frozen.matchingDatabase, 'Matching database binding');
+  const model = requireRecord(frozen.triangulatedModel, 'Triangulated model binding');
+  const binaryModel = requireRecord(
+    frozen.triangulatedBinaryModel,
+    'Triangulated binary model binding'
+  );
+  if (typeof database.path !== 'string' || typeof database.sha256 !== 'string') {
+    throw new Error('Matching database binding is malformed.');
+  }
+  const databasePath = resolve(run.runDirectory, database.path);
+  const databaseRelative = relative(run.runDirectory, databasePath);
+  if (
+    databaseRelative.startsWith('..') ||
+    isAbsolute(databaseRelative) ||
+    database.sha256 !== sha256(await readFile(databasePath))
+  ) {
+    throw new Error('Frozen matching database changed before transfer.');
+  }
+  for (const filename of ['cameras.txt', 'images.txt', 'points3D.txt']) {
+    if (
+      model[filename] !==
+      sha256(
+        await readFile(
+          join(run.runDirectory, 'exports', 'triangulated', filename)
+        )
+      )
+    ) {
+      throw new Error(`Frozen triangulated ${filename} changed before transfer.`);
+    }
+  }
+  for (const filename of [
+    'cameras.bin',
+    'frames.bin',
+    'images.bin',
+    'points3D.bin',
+    'rigs.bin',
+  ]) {
+    if (
+      binaryModel[filename] !==
+      sha256(
+        await readFile(
+          join(run.runDirectory, 'models', 'triangulated', filename)
+        )
+      )
+    ) {
+      throw new Error(`Frozen triangulated ${filename} changed before transfer.`);
+    }
+  }
+}
+
+function recorderPoseModel(model: RecorderColmapModel): PoseSafetyModel {
+  return {
+    images: model.images.map((image) => ({
+      imageId: image.imageId,
+      cameraId: image.cameraId,
+      name: image.name,
+      qvec: image.pose.qvec,
+      tvec: image.pose.tvec,
+      observations: [],
+    })),
+  };
 }
 
 function poseOnlyModel(

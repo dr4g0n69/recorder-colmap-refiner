@@ -43,8 +43,70 @@ def write_json_once(path: Path, value: Any) -> None:
         output.write("\n")
 
 
+def reserve_native_start(
+    path: Path, attempt_sha256: str, inspection_sha256: str
+) -> str:
+    write_json_once(
+        path,
+        {
+            "schemaVersion": 1,
+            "permanent": True,
+            "startedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "attemptSha256": attempt_sha256,
+            "inspectionSha256": inspection_sha256,
+        },
+    )
+    return sha256_file(path)
+
+
 def file_hashes(directory: Path, filenames: tuple[str, ...]) -> dict[str, str]:
     return {name: sha256_file(directory / name) for name in filenames}
+
+
+def verify_pre_ba_bindings(run_directory: Path, pre_ba: dict[str, Any]) -> dict[str, Any]:
+    bindings = pre_ba.get("bindings")
+    if not isinstance(bindings, dict):
+        raise ValueError("Pre-BA evidence lacks frozen input bindings")
+    database = bindings.get("matchingDatabase")
+    model = bindings.get("triangulatedModel")
+    binary_model = bindings.get("triangulatedBinaryModel")
+    if (
+        not isinstance(database, dict)
+        or not isinstance(model, dict)
+        or not isinstance(binary_model, dict)
+    ):
+        raise ValueError("Pre-BA evidence has malformed input bindings")
+    database_path = (run_directory / str(database.get("path", ""))).resolve()
+    try:
+        database_path.relative_to(run_directory)
+    except ValueError as error:
+        raise ValueError("Matching database path escapes the run directory") from error
+    if sha256_file(database_path) != database.get("sha256"):
+        raise ValueError("Frozen matching database changed")
+    for filename in ("cameras.txt", "images.txt", "points3D.txt"):
+        if (
+            sha256_file(run_directory / "exports" / "triangulated" / filename)
+            != model.get(filename)
+        ):
+            raise ValueError(f"Frozen triangulated {filename} changed")
+    for filename in (
+        "cameras.bin",
+        "frames.bin",
+        "images.bin",
+        "points3D.bin",
+        "rigs.bin",
+    ):
+        if (
+            sha256_file(run_directory / "models" / "triangulated" / filename)
+            != binary_model.get(filename)
+        ):
+            raise ValueError(f"Frozen triangulated {filename} changed")
+    if (
+        sha256_file(run_directory / "metrics" / "correspondences.json")
+        != bindings.get("correspondencesSha256")
+    ):
+        raise ValueError("Frozen correspondences changed")
+    return bindings
 
 
 def runtime_identity(pycolmap: Any) -> dict[str, Any]:
@@ -209,6 +271,10 @@ def build_problem(
     input_sha256: str,
     pre_ba_sha256: str,
 ) -> tuple[Any, Any, dict[str, Any]]:
+    optimization_inputs = verify_pre_ba_bindings(
+        run_directory,
+        read_json(run_directory / "metrics" / "pre-ba-support.json"),
+    )
     reconstruction = pycolmap.Reconstruction(
         run_directory / "models" / "triangulated"
     )
@@ -262,6 +328,23 @@ def build_problem(
     scalar_residuals = config.num_residuals(reconstruction)
     if scalar_residuals != linked_observations * 2:
         raise ValueError("Configured residuals do not match linked observations")
+    residual_observations = sorted(
+        (
+            {
+                "imageId": int(element.image_id),
+                "point2DIndex": int(element.point2D_idx),
+                "point3DId": int(point_id),
+            }
+            for point_id, point in reconstruction.points3D.items()
+            for element in point.track.elements
+        ),
+        key=lambda entry: (entry["imageId"], entry["point2DIndex"], entry["point3DId"]),
+    )
+    if len(residual_observations) != linked_observations:
+        raise ValueError("Residual observation inventory is incomplete")
+    reconstruction_image_ids = sorted(
+        int(image.image_id) for image in reconstruction.images.values()
+    )
     adjuster = pycolmap.create_default_bundle_adjuster(
         options, config, reconstruction
     )
@@ -272,6 +355,7 @@ def build_problem(
         "solveCalled": False,
         "inputSha256": input_sha256,
         "preBaSupportSha256": pre_ba_sha256,
+        "optimizationInputs": optimization_inputs,
         "driverSha256": sha256_file(Path(__file__)),
         **runtime_identity(pycolmap),
         "registeredImageCount": len(images),
@@ -281,6 +365,20 @@ def build_problem(
         "fixedIntrinsicsCameraCount": config.num_constant_cam_intrinsics(),
         "linkedObservationCount": linked_observations,
         "scalarReprojectionResidualCount": scalar_residuals,
+        "residualSelection": {
+            "method": "pycolmap-config-num-residuals-v2",
+            "nativeApi": "BundleAdjustmentConfig.num_residuals",
+            "configuredImageIds": reconstruction_image_ids,
+            "reconstructionImageIds": reconstruction_image_ids,
+            "linkedObservationCount": linked_observations,
+            "expectedScalarResidualCount": linked_observations * 2,
+            "nativeScalarResidualCount": scalar_residuals,
+            "identityProof": {
+                "status": "unavailable",
+                "reason": "PyCOLMAP exposes the selected residual count, not residual identities",
+            },
+            "observationIdentities": residual_observations,
+        },
         "anchors": anchor_mapping,
         "effectiveConfig": config.summary(),
         "effectiveOptions": options.summary(),
@@ -302,6 +400,17 @@ def inspect_problem(
     )[2]
 
 
+def has_verified_identity_proof(details: dict[str, Any]) -> bool:
+    selection = details.get("residualSelection")
+    proof = selection.get("identityProof") if isinstance(selection, dict) else None
+    return (
+        isinstance(proof, dict)
+        and proof.get("status") == "verified"
+        and proof.get("method") == "native-residual-identity-inventory-v1"
+        and proof.get("pycolmapBinaryHashes") == details.get("pycolmapBinaryHashes")
+    )
+
+
 def solve_problem(
     pycolmap: Any,
     run_directory: Path,
@@ -310,6 +419,7 @@ def solve_problem(
 ) -> dict[str, Any]:
     inspection_path = run_directory / "evidence" / "ba-inspection.json"
     attempt_path = run_directory / "evidence" / "ba-attempt.json"
+    native_start_path = run_directory / "evidence" / "ba-native-start.json"
     binary_output = run_directory / "models" / "adjusted"
     text_output = run_directory / "exports" / "adjusted"
     pending_binary = run_directory / "models" / f".adjusted.pending-{os.getpid()}"
@@ -320,6 +430,7 @@ def solve_problem(
         text_output,
         pending_binary,
         pending_text,
+        native_start_path,
     ):
         if path.exists():
             raise FileExistsError(f"BA execution artifact already exists: {path}")
@@ -343,6 +454,8 @@ def solve_problem(
         raise ValueError("Permanent BA attempt is stale or incomplete")
 
     inspection = read_json(inspection_path)
+    if not has_verified_identity_proof(inspection):
+        raise ValueError("BA solve requires verified native residual-identity evidence")
     reconstruction, adjuster, details = build_problem(
         pycolmap,
         run_directory,
@@ -363,13 +476,19 @@ def solve_problem(
         "anchors",
         "effectiveConfig",
         "effectiveOptions",
+        "residualSelection",
+        "optimizationInputs",
     ):
         if details[field] != inspection.get(field):
             raise ValueError(f"BA solve differs from inspected field: {field}")
-
     before_poses = pose_snapshot(reconstruction)
     before_intrinsics = intrinsics_snapshot(reconstruction)
     before_identity = identity_snapshot(reconstruction)
+    native_start_sha256 = reserve_native_start(
+        native_start_path,
+        args.attempt_sha256,
+        args.inspection_sha256,
+    )
     started = time.perf_counter()
     summary = adjuster.solve()
     elapsed_seconds = time.perf_counter() - started
@@ -391,14 +510,17 @@ def solve_problem(
         "solutionUsable": usable,
         "inputSha256": args.input_sha256,
         "preBaSha256": args.pre_ba_sha256,
+        "optimizationInputs": details["optimizationInputs"],
         "inspectionSha256": args.inspection_sha256,
         "attemptSha256": args.attempt_sha256,
+        "nativeStartSha256": native_start_sha256,
         "driverSha256": sha256_file(Path(__file__)),
         "resolvedConfigSha256": args.resolved_config_sha256,
         "pycolmapBinaryHashes": details["pycolmapBinaryHashes"],
         "effectiveConfig": details["effectiveConfig"],
         "effectiveOptions": details["effectiveOptions"],
         "scalarReprojectionResidualCount": residual_count,
+        "residualSelection": details["residualSelection"],
         "elapsedSeconds": elapsed_seconds,
         "termination": str(summary.termination_type),
         "briefReport": summary.brief_report(),
@@ -462,6 +584,9 @@ def main(argv: list[str] | None = None) -> int:
     pre_ba = json.loads(pre_ba_path.read_text(encoding="utf-8"))
     if not isinstance(pre_ba, dict) or pre_ba.get("status") != "pass":
         raise ValueError("Pre-BA support gate is not passing")
+    bindings = verify_pre_ba_bindings(run_directory, pre_ba)
+    if bindings.get("inputSha256") != args.input_sha256:
+        raise ValueError("Pre-BA evidence is bound to a different input ZIP")
     report = args.report.resolve()
     try:
         report.relative_to(run_directory)
