@@ -1,0 +1,21 @@
+{
+  "inputZip": "../captures/recording.zip",
+  "outputDirectory": "../runs",
+  "colmap": {
+    "executable": "C:/Tools/COLMAP/bin/colmap.exe",
+    "version": "REPLACE_WITH_TEXT_FROM_COLMAP_HELP",
+    "build": "REPLACE_WITH_TEXT_FROM_COLMAP_HELP",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "python": {
+    "executable": "C:/Tools/refiner/.venv/Scripts/python.exe",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "pycolmapVersion": "REPLACE_WITH_INSTALLED_PYCOLMAP_VERSION"
+  },
+  "anchors": [
+    "frame-000001.jpg",
+    "frame-000046.jpg",
+    "frame-000091.jpg"
+  ],
+  "loopPairs": [["frame-000001.jpg", "frame-000091.jpg"]]
+}
