@@ -13,6 +13,7 @@ import { verifyPreBaSupport } from './refiner/pre-ba-support.js';
 import { inspectBundleAdjustment } from './refiner/ba-inspection.js';
 import { runBundleAdjustment } from './refiner/ba-solve.js';
 import { evaluatePostBaSafety } from './refiner/post-ba-safety.js';
+import { transferAcceptedCandidate } from './refiner/pose-transfer.js';
 
 type WriteMessage = (message: string) => void;
 
@@ -71,8 +72,13 @@ export async function runRefinerCli(
     writeMessage('Three-anchor bundle adjustment: complete');
     const verdict = await evaluatePostBaSafety(preflight, run);
     writeMessage(`Post-BA geometry: ${verdict}`);
-    writeMessage('Pipeline execution is not implemented yet.');
-    return 1;
+    if (verdict !== 'Pass') {
+      writeMessage(`Candidate ZIP not generated: ${verdict}`);
+      return 1;
+    }
+    const transfer = await transferAcceptedCandidate(preflight, run);
+    writeMessage(`Candidate ZIP: ${transfer.outputPath}`);
+    return 0;
   } catch (error) {
     writeMessage(
       `Execution error: ${error instanceof Error ? error.message : String(error)}`

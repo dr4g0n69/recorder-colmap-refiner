@@ -713,7 +713,7 @@ describe('runRefinerCli', () => {
     expect(messages[6]).toBe('BA configuration: inspected without solving');
     expect(messages[7]).toBe('Three-anchor bundle adjustment: complete');
     expect(messages[8]).toBe('Post-BA geometry: Rejected');
-    expect(messages[9]).toBe('Pipeline execution is not implemented yet.');
+    expect(messages[9]).toBe('Candidate ZIP not generated: Rejected');
     expect(messages[10]).toMatch(/^Prepared run: /);
     expect(messages[11]).toBe('Feature extraction: complete');
     expect(messages[12]).toBe('Feature database identity: verified');
@@ -723,7 +723,7 @@ describe('runRefinerCli', () => {
     expect(messages[16]).toBe('BA configuration: inspected without solving');
     expect(messages[17]).toBe('Three-anchor bundle adjustment: complete');
     expect(messages[18]).toBe('Post-BA geometry: Rejected');
-    expect(messages[19]).toBe('Pipeline execution is not implemented yet.');
+    expect(messages[19]).toBe('Candidate ZIP not generated: Rejected');
     expect(messages).toHaveLength(20);
   });
 });
