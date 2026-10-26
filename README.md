@@ -1,10 +1,21 @@
 # Recorder COLMAP Refiner
 
-An experimental, offline pipeline for improving camera translations in a
-recorder COLMAP ZIP without replacing the original archive or silently changing
-its cameras, points, image identities, or other assets.
+An experimental offline tool for refining camera positions in recorded 3D
+captures while preserving the recorder's original data. Small position errors
+can misalign views and produce duplicated or blurred reconstruction geometry.
+Built for a university SoftwareLab Gaussian-splatting project, the tool combines
+COLMAP processing with strict validation, reproducible evidence, and safe ZIP
+export. It is intended to test whether constrained refinement can help; it does
+not claim demonstrated visual improvement.
 
-The tool runs this fixed workflow:
+> [!IMPORTANT]
+> This is a fail-closed research prototype. PyCOLMAP 4.2 reports the selected
+> residual count but not the selected residual identities, so a real run
+> currently stops before bundle adjustment rather than publishing an
+> unverifiable result. The ZIP reader/writer and safety boundaries are complete
+> and tested.
+
+## Intended complete pipeline
 
 ```text
 recorder ZIP
@@ -12,18 +23,39 @@ recorder ZIP
      (clean selected-pair fallback on failure)
   -> fixed-pose triangulation
   -> pre-BA support checks
+  -> CURRENT STOP: native residual-identity evidence is unavailable
   -> inspected three-anchor, translation-only bundle adjustment
   -> post-BA geometry and identity gates
   -> separate, reopened, verified candidate ZIP
 ```
 
+SIFT finds repeatable image features, and matching links the same visual points
+between images. Triangulation estimates temporary 3D working points from those
+links. Constrained bundle adjustment then attempts to reduce reprojection error
+by changing camera translations while keeping rotations, camera intrinsics
+(focal length and principal point), and three anchor poses fixed.
+
 It is a local engineering tool, not a recorder UI. It has no runtime dependency
-on LichtFeld. A controlled LichtFeld comparison can be performed later, after a
-candidate passes the tool's deterministic checks.
+on LichtFeld, a desktop application used to train and inspect Gaussian splats. A
+controlled LichtFeld comparison can be performed later, after a candidate passes
+the tool's deterministic checks.
+
+## Safety properties
+
+- Never overwrites the input ZIP.
+- Preserves rotations, intrinsics, image identities, anchor poses, the recorder
+  points exported to the candidate ZIP, and unrelated archive entries. Temporary
+  working points may be optimized internally during bundle adjustment.
+- Hash-binds the inputs, native tools, configuration, and evidence used by a
+  run.
+- Allows one bundle-adjustment attempt per run directory.
+- Publishes a candidate only after reopening and verifying the generated ZIP.
+- Reports missing or stale evidence as `Inconclusive`, not as success.
 
 ## Requirements
 
 - Node.js 24.14.0 and pnpm 11.11.0
+- `uv` for the frozen Python environment
 - The verified native baseline is COLMAP 4.2.0, commit `be5e291`, CUDA build.
   Other builds require a separate controlled verification.
 - Python 3.12.14, NumPy 2.5.3, and PyCOLMAP 4.2.0, installed from
@@ -33,9 +65,10 @@ candidate passes the tool's deterministic checks.
 - A GPU available to the configured COLMAP exhaustive matcher
 
 After dependencies and tools are installed, the refinement run itself does not
-need network access.
+need network access. Development and automated verification were performed on
+Windows using PowerShell.
 
-## Install and verify
+## Quick start
 
 ```powershell
 pnpm install --frozen-lockfile
@@ -109,10 +142,6 @@ Post-BA geometry has three possible verdicts:
 - `Inconclusive`: required evidence was absent, stale, non-finite, or otherwise
   insufficient.
 
-PyCOLMAP 4.2 exposes the selected residual count but not the selected residual
-identities. Until native identity-selection evidence is available, a real run
-stops as `Inconclusive` after inspection and before starting BA.
-
 Only `Pass` produces `output/candidate.zip`. The transfer stage reopens that ZIP
 and verifies pose serialization, frame and scale safety, and preservation of the
 original points, intrinsics, identities, and archive assets. It never overwrites
@@ -125,6 +154,25 @@ Gaussian splat will look better. If visual confirmation is required, train the
 original and candidate with the same LichtFeld version, settings, and viewpoints
 and retain both outputs as separate evidence.
 
+## Validation and results
+
+Automated TypeScript and Python tests cover COLMAP text parsing and writing,
+archive preservation, input and evidence hashes, one-shot optimization guards,
+geometry verdicts, pose-only transfer, reopened-ZIP checks, and atomic
+publication. The package check also type-checks, builds, and smoke-tests the
+installed command layout.
+
+The earlier SoftwareLab experiment workflow—not this standalone command—was run
+on a real recorder capture through constrained bundle adjustment, verified ZIP
+transfer, and a controlled LichtFeld comparison. That single experiment informed
+the standalone safety design but does not establish general visual improvement.
+
+The standalone command currently stops after native inspection with an
+`Inconclusive` result because PyCOLMAP does not expose the selected residual
+identities required by its evidence policy. It therefore performs no bundle
+adjustment and publishes no `candidate.zip`. Real standalone optimization,
+multi-capture validation, and demonstrated visual improvement remain unverified.
+
 ## Current limits
 
 - The supported recorder contract is COLMAP text with a single `PINHOLE` camera.
@@ -133,13 +181,17 @@ and retain both outputs as separate evidence.
 - Matching, thresholds, three-anchor policy, and safety gates are fixed rather
   than user-tunable.
 - Anchor and loop-pair selection is not automated.
-- The workflow has been exercised as a controlled local experiment, not as a
-  general-purpose COLMAP repair tool.
+- The earlier experimental workflow was exercised locally; the standalone
+  command remains a fail-closed prototype, not a general-purpose COLMAP repair
+  tool.
 - LichtFeld training and visual comparison are intentionally outside this CLI.
 
 Future work should start with more varied recorder captures and independently
 reviewed evidence before widening the COLMAP subset, automating selection, or
 changing the optimization and acceptance policies.
+
+The reusable recorder ZIP reader/writer is also proposed for the main project
+in [cs-util-com/location-based-webxr#635](https://github.com/cs-util-com/location-based-webxr/pull/635).
 
 ## Contributions and maintenance
 
@@ -148,10 +200,25 @@ service. Issues and focused pull requests are welcome, but ongoing support and
 response times are not guaranteed. Changes to optimization or acceptance rules
 must include evidence and counterexample tests.
 
+## Contributors
+
+- [Filip](https://github.com/dr4g0n69) — standalone TypeScript CLI, COLMAP ZIP
+  handling, safety checks, Python-driver integration, and automated tests
+- [Mingna](https://github.com/Zhi-Yu941) — refinement-workflow design,
+  experimental pipeline construction and review, LichtFeld training, and visual
+  evaluation
+
 ## Acknowledgements
 
-Filip and Mingna developed and evaluated the Team 6 pipeline. Simon served as
-Product Owner and contributed the project requirements and research direction.
+Simon served as Product Owner for the university SoftwareLab project and
+contributed the requirements and research direction.
+
+## AI assistance
+
+AI tools assisted with planning, implementation, debugging, documentation, and
+code review. Filip and Mingna reviewed and tested the resulting work and remain
+responsible for the accepted design decisions and code. AI review does not
+replace experimental validation.
 
 ## Licence
 
